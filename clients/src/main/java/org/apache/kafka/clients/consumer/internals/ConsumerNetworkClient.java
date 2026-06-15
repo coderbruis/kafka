@@ -524,6 +524,15 @@ public class ConsumerNetworkClient implements Closeable {
         return pollDelayMs;
     }
 
+    /**
+     * wakeup() 可以打断所有内部执行了可唤醒网络等待的 Consumer API，不只 poll()。
+     * 常见的包括：poll()\commitSync()\position()\committed()\partitionsFor()
+     * \listTopics()\offsetsForTimes()\beginningOffsets()\endOffsets()（都是ClassicKafkaConsumer类里的方法)
+     * 这种比较粗鲁的wakeup操作常见场景有：
+     * 1）kubernetes发布或者缩容时发送SIGTERM；
+     * 2）JVM执行shutdown hook；
+     * 3）Spring容器关闭；
+     */
     public void maybeTriggerWakeup() {
         if (!wakeupDisabled.get() && wakeup.get()) {
             log.debug("Raising WakeupException in response to user wakeup");
@@ -538,6 +547,13 @@ public class ConsumerNetworkClient implements Closeable {
         }
     }
 
+    /**
+     * 关闭时不能因为wakeup触发：wakeupException异常阻断wakeUp，关闭时可能还需要：1) 自动提交 offset; 2）等待异步提交完成；3）发送离组请求；4）关闭 Fetch Session
+     * 这些清理操作不应被另一个线程的 consumer.wakeup() 中断。
+     *
+     * 而且该方法没有对应的 enableWakeups()，说明这是一个永久状态切换：一旦禁用，就意味着客户端已经进入不可恢复的关闭阶段。
+     * 使用 AtomicBoolean 是为了保证其他线程调用 wakeup() 时能立即看到这个状态。
+     */
     public void disableWakeups() {
         wakeupDisabled.set(true);
     }

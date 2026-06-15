@@ -93,6 +93,11 @@ public class KafkaConsumerMetrics extends AbstractConsumerMetricsManager {
         );
     }
 
+    /**
+     * 记住这次 poll() 从什么时候开始，并统计两次 poll() 调用之间隔了多久。
+     * 每个Consumer实例独立统计自身连续两次 poll() 的起始时间间隔，通常由同一个消费线程操作，直到该 Consumer 被关闭。
+     * @param pollStartMs
+     */
     public void recordPollStart(long pollStartMs) {
         this.pollStartMs = pollStartMs;
         this.timeSinceLastPollMs = lastPollMs != 0L ? pollStartMs - lastPollMs : 0;

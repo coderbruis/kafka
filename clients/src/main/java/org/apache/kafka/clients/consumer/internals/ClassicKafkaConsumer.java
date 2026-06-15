@@ -648,16 +648,20 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
     private ConsumerRecords<K, V> poll(final Timer timer) {
         acquireAndEnsureOpen();
         try {
+            // 统计同一线程两次 poll() 调用之间隔了多久
             this.kafkaConsumerMetrics.recordPollStart(timer.currentTimeMs());
 
+            // 消费者必须订阅主题，并且自动分区或者手动指定分区
             if (this.subscriptions.hasNoSubscriptionOrUserAssignment()) {
                 throw new IllegalStateException("Consumer is not subscribed to any topics or assigned any partitions");
             }
 
             do {
+                // 在可能发生阻塞操作前响应用户通过 wakeup() 发出的唤醒请求。
                 client.maybeTriggerWakeup();
 
                 // try to update assignment metadata BUT do not need to block on the timer for join group
+                // 在拉取消息前，先确保消费者已经完成入组和分区分配，并准备好各分区接下来应该从哪个 offset 开始消费。
                 updateAssignmentMetadataIfNeeded(timer, false);
 
                 final Fetch<K, V> fetch = pollForFetches(timer);
@@ -693,6 +697,12 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
         return fetcher.sendFetches();
     }
 
+    /**
+     * 在拉取消息前，先确保消费者已经完成入组和分区分配，并准备好各分区接下来应该从哪个 offset 开始消费。
+     * @param timer
+     * @param waitForJoinGroup true：在这里等入组完成。。false：先发起或推进入组，没完成就先往下走，后续循环继续。
+     * @return
+     */
     boolean updateAssignmentMetadataIfNeeded(final Timer timer, final boolean waitForJoinGroup) {
         if (coordinator != null && !coordinator.poll(timer, waitForJoinGroup)) {
             return false;
@@ -1230,6 +1240,9 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
     }
 
     /**
+     * KafkaConsumer 不是线程安全的。进入 poll 前获取使用权，并确认消费者尚未关闭。
+     * 在kafka中除了wakeup()和close()，只要读取或者修改Consumer内部状态的公开方法都需要调acquireAndEnsureOpen()。
+     * <p>
      * Acquire the light lock and ensure that the consumer hasn't been closed.
      * @throws IllegalStateException If the consumer has been closed
      */
@@ -1242,6 +1255,8 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
     }
 
     /**
+     * 检测并阻止多个线程同时使用同一个 KafkaConsumer。允许同一线程重入，refcount计算重入次数。
+     * <p>
      * Acquire the light lock protecting this consumer from multi-threaded access. Instead of blocking
      * when the lock is not available, however, we just throw an exception (since multi-threaded usage is not
      * supported).
@@ -1255,6 +1270,7 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
                     "currentThread(name: " + thread.getName() + ", id: " + threadId + ")" +
                     " otherThread(id: " + currentThread.get() + ")"
             );
+        // 重入次数计算
         refcount.incrementAndGet();
     }
 
