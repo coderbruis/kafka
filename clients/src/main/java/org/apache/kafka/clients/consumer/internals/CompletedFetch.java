@@ -184,58 +184,93 @@ public class CompletedFetch {
         }
     }
 
+    /**
+     * 从 broker 返回的原始 RecordBatch 里，找到下一条可以返回给用户的普通消息 record。
+     * 它会跳过：
+     * - 已经过期的旧 offset record
+     * - control record
+     * - read_committed 下已 abort 事务的数据
+     * - 空 batch / 已读完的 batch
+     * 同时它会：
+     * - 校验 batch / record 是否损坏
+     * - 更新 nextFetchOffset
+     * - 更新当前 batch 的 leader epoch
+     * - 标记这批 fetch 是否已经读完
+     *
+     * nextFetchedRecord() 是 CompletedFetch 内部的底层游标方法。
+     * 它负责在原始 RecordBatch 中向前扫描，跳过 Kafka 内部不可见的数据，最终返回下一条用户应该看到的消息 record；如果没有更多消息，就返回 null 并标记 exhausted。
+     */
     private Record nextFetchedRecord(FetchConfig fetchConfig) {
         while (true) {
+            // 如果当前 batch 没有正在使用的 record iterator，或者当前 batch 已经读完，就准备切换到下一个 batch。
             if (records == null || !records.hasNext()) {
+                // 关闭当前 batch 的 record iterator，释放解压相关资源。
                 maybeCloseRecordStream();
-
+                // 如果没有更多 batch 了，说明这个 CompletedFetch 快读完了。
                 if (!batches.hasNext()) {
                     // Message format v2 preserves the last offset in a batch even if the last record is removed
                     // through compaction. By using the next offset computed from the last offset in the batch,
                     // we ensure that the offset of the next fetch will point to the next batch, which avoids
                     // unnecessary re-fetching of the same batch (in the worst case, the consumer could get stuck
                     // fetching the same batch repeatedly).
+
+                    // 如果之前处理过 batch，把 nextFetchOffset 推到当前 batch 的下一个 offset。
+                    // 这对压缩/compact 场景很重要：即使 batch 中最后一条实际 record 被删除，也要用 batch 级别的 nextOffset() 前进，避免反复 fetch 同一个 batch。
                     if (currentBatch != null)
                         nextFetchOffset = currentBatch.nextOffset();
+                    // 标记这批 fetch 数据已经读尽。
                     exhausted = true;
                     return null;
                 }
 
+                // 切换到下一个 RecordBatch。
                 currentBatch = batches.next();
+                // 记录当前 batch 的 leader epoch。后续更新消费 position 时会用到。
                 lastEpoch = maybeLeaderEpoch(currentBatch.partitionLeaderEpoch());
+                // 如果开启 CRC 校验，就校验整个 batch 是否有效。
                 maybeEnsureValid(fetchConfig, currentBatch);
 
+                // 如果消费者使用 read_committed，并且当前 batch 属于某个 producer，就需要处理事务可见性。
                 if (fetchConfig.isolationLevel == IsolationLevel.READ_COMMITTED && currentBatch.hasProducerId()) {
                     // remove from the aborted transaction queue all aborted transactions which have begun
                     // before the current batch's last offset and add the associated producerIds to the
                     // aborted producer set
+                    // 把 abort transaction 列表中，起始 offset 不超过当前 batch last offset 的事务消费出来，并记录对应 producer id。
+                    // 这样后面可以判断当前 batch 是否属于已 abort 事务。
                     consumeAbortedTransactionsUpTo(currentBatch.lastOffset());
 
                     long producerId = currentBatch.producerId();
+                    // 如果当前 batch 是 abort marker，说明这个 producer 的 abort 事务范围结束了，从 aborted producer 集合里移除。
                     if (containsAbortMarker(currentBatch)) {
                         abortedProducerIds.remove(producerId);
                     } else if (isBatchAborted(currentBatch)) {
                         log.debug("Skipping aborted record batch from partition {} with producerId {} and " +
                                         "offsets {} to {}",
                                 partition, producerId, currentBatch.baseOffset(), currentBatch.lastOffset());
+                        // 把 offset 推进到这个 aborted batch 后面。
                         nextFetchOffset = currentBatch.nextOffset();
                         continue;
                     }
                 }
-
+                // 为当前 batch 创建 record iterator。如果 batch 是压缩的，这里会用 decompressionBufferSupplier 进行流式解压。
                 records = currentBatch.streamingIterator(decompressionBufferSupplier);
-            } else {
+            } else {        // 进入这里表示当前 batch 的 record iterator 还有数据。
                 Record record = records.next();
                 // skip any records out of range
+                // 只处理 offset 没有过期的 record。如果 record offset 小于 nextFetchOffset，说明它已经被消费过或应该跳过。
                 if (record.offset() >= nextFetchOffset) {
                     // we only do validation when the message should not be skipped.
                     maybeEnsureValid(fetchConfig, record);
 
                     // control records are not returned to the user
+                    // 如果不是 control batch，就返回这条普通消息 record。
+                    // 这是用户最终能看到的消息。
                     if (!currentBatch.isControlBatch()) {
                         return record;
                     } else {
                         // Increment the next fetch offset when we skip a control batch.
+                        // 如果是 control record，不返回给用户，但要推进 offset。
+                        // control record 是 Kafka 内部事务控制消息，例如 commit/abort marker。
                         nextFetchOffset = record.offset() + 1;
                     }
                 }
@@ -244,6 +279,8 @@ public class CompletedFetch {
     }
 
     /**
+     * 从一个已经 fetch 回来的分区数据里，最多取出 maxRecords 条消息，校验记录、跳过不该返回的记录、反序列化 key/value，最后生成 ConsumerRecord 列表。
+     *
      * The {@link RecordBatch batch} of {@link Record records} is converted to a {@link List list} of
      * {@link ConsumerRecord consumer records} and returned. {@link BufferSupplier Decompression} and
      * {@link Deserializer deserialization} of the {@link Record record's} key and value are performed in
@@ -258,11 +295,13 @@ public class CompletedFetch {
                                                    Deserializers<K, V> deserializers,
                                                    int maxRecords) {
         // Error when fetching the next record before deserialization.
+        // 如果上一次是在“读取下一条原始 record”阶段失败，比如 batch 损坏，就直接抛异常。
+        // 这种情况下没法靠重新反序列化恢复，只能提示用户必要时 seek 跳过坏 record。
         if (corruptLastRecord)
             throw new KafkaException("Received exception when fetching the next record from " + partition
                     + ". If needed, please seek past the record to "
                     + "continue consumption.", cachedRecordException);
-
+        // 如果这个 CompletedFetch 已经被 drain/消费完了，就直接返回空列表。
         if (isConsumed)
             return Collections.emptyList();
 
@@ -274,19 +313,24 @@ public class CompletedFetch {
                 // use the last record to do deserialization again.
                 if (cachedRecordException == null) {
                     corruptLastRecord = true;
+                    // 读取下一条可返回的原始 record。
                     lastRecord = nextFetchedRecord(fetchConfig);
                     corruptLastRecord = false;
                 }
 
                 if (lastRecord == null)
                     break;
-
+                // 取当前 batch 的 leader epoch，后面放进 ConsumerRecord。
                 Optional<Integer> leaderEpoch = maybeLeaderEpoch(currentBatch.partitionLeaderEpoch());
                 TimestampType timestampType = currentBatch.timestampType();
+                // 反序列化 key 和 value，把底层原始 Record 转成用户看到的 ConsumerRecord。
                 ConsumerRecord<K, V> record = parseRecord(deserializers, partition, leaderEpoch, timestampType, lastRecord);
                 records.add(record);
+                // 统计record数
                 recordsRead++;
+                // 统计已读字节数
                 bytesRead += lastRecord.sizeInBytes();
+                // 推进下次fetch的offset
                 nextFetchOffset = lastRecord.offset() + 1;
                 // In some cases, the deserialization may have thrown an exception and the retry may succeed,
                 // we allow user to move forward in this case.

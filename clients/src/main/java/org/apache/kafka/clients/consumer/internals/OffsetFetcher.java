@@ -112,6 +112,8 @@ public class OffsetFetcher {
     }
 
     /**
+     * 检查已有的 fetch position 是否还有效。
+     * 主要场景是 leader 发生变化后，分区日志可能被截断，原来的 offset 可能已经不合法，所以需要异步发请求去校验。
      * Validate offsets for all assigned partitions for which a leader change has been detected.
      */
     public void validatePositionsIfNeeded() {

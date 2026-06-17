@@ -130,9 +130,12 @@ public class ConsumerNetworkClient implements Closeable {
         RequestFutureCompletionHandler completionHandler = new RequestFutureCompletionHandler();
         ClientRequest clientRequest = client.newClientRequest(node.idString(), requestBuilder, now, true,
             requestTimeoutMs, completionHandler);
+        // 存一份待发送请求
         unsent.put(node, clientRequest);
 
         // wakeup the client in case it is blocking in poll so that we can send the queued request
+        // send() 把请求放进 unsent 队列后，叫醒正在 poll() 里阻塞等待网络事件的底层网络客户端，让它赶紧回来看看有没有新请求要发。
+        // 如果不wakeup，请求可能被延迟发送。新请求入队后，立刻叫醒网络 poll，让它尽快把请求从 unsent 发出去，而不是傻等 poll 超时。
         client.wakeup();
         return completionHandler.future;
     }
@@ -261,6 +264,8 @@ public class ConsumerNetworkClient implements Closeable {
      */
     public void poll(Timer timer, PollCondition pollCondition, boolean disableWakeup) {
         // there may be handlers which need to be invoked if we woke up the previous call to poll
+        // 方法一进来就调用，上一次 poll() 过程中可能已经有请求完成了，但回调没有在当时立刻执行，而是先放进了 pendingCompletion。
+        // 核心作用：先把上一轮已经完成的请求结果通知给上层，再决定这轮还要不要继续阻塞等网络 IO。
         firePendingCompletedRequests();
 
         lock.lock();
@@ -419,6 +424,9 @@ public class ConsumerNetworkClient implements Closeable {
         }
     }
 
+    /**
+     * 就是把“已完成但还没通知上层”的请求结果集中通知出去，并在通知后唤醒网络轮询，让等待方尽快感知到结果。
+     */
     private void firePendingCompletedRequests() {
         boolean completedRequestsFired = false;
         for (;;) {

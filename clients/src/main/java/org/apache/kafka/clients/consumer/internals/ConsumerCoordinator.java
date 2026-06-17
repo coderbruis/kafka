@@ -477,6 +477,9 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         }
     }
 
+    /**
+     * 检查集群元数据是否发生变化。如果有新主题、新分区等变化，就更新本地订阅快照；正则订阅还会重新匹配主题。
+     */
     void maybeUpdateSubscriptionMetadata() {
         int version = metadata.updateVersion();
         if (version > metadataSnapshot.version) {
@@ -491,6 +494,11 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         }
     }
 
+    /**
+     * 如果还不知道消费组协调器是谁，就在剩余时间内尝试寻找并连接它。超时仍未准备好，返回 false。
+     * @param timer
+     * @return
+     */
     private boolean coordinatorUnknownAndUnreadySync(Timer timer) {
         return coordinatorUnknown() && !ensureCoordinatorReady(timer);
     }
@@ -500,6 +508,14 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
     }
 
     /**
+     * 维护消费者与消费组之间的关系：更新订阅信息、处理提交回调、保持心跳、寻找协调器、在需要时加入或重新加入消费组，最后按周期自动提交消费位点。
+     * 更新订阅信息
+     * → 处理异步提交回调
+     * → 自动分配：维护心跳、找协调器、必要时重新入组
+     *   手动分配：必要时刷新元数据并推进网络请求
+     * → 到期则自动提交位点
+     * → 返回成功
+     * <p>
      * Poll for coordinator events. This ensures that the coordinator is known and that the consumer
      * has joined the group (if it is using group management). This also handles periodic offset commits
      * if they are enabled.
@@ -517,21 +533,25 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         invokeCompletedOffsetCommitCallbacks();
 
         if (subscriptions.hasAutoAssignedPartitions()) {
+            // 校验自动分配分区策略，为空抛异常拦截
             if (protocol == null) {
                 throw new IllegalStateException("User configured " + ConsumerConfig.PARTITION_ASSIGNMENT_STRATEGY_CONFIG +
                     " to empty while trying to subscribe for group protocol to auto assign partitions");
             }
             // Always update the heartbeat last poll time so that the heartbeat thread does not leave the
             // group proactively due to application inactivity even if (say) the coordinator cannot be found.
+            // 刷新心跳时间，告诉kafka我当前调用fetch的消费者应用还活着
             pollHeartbeat(timer.currentTimeMs());
             if (coordinatorUnknownAndUnreadySync(timer)) {
                 return false;
             }
 
+            // 检查是否需要加入或重新加入消费组
             if (rejoinNeededOrPending()) {
                 // due to a race condition between the initial metadata fetch and the initial rebalance,
                 // we need to ensure that the metadata is fresh before joining initially. This ensures
                 // that we have matched the pattern against the cluster's topics at least once before joining.
+                // 如果消费者使用正则表达式订阅主题，需要在入组前刷新元数据，确保主题匹配结果尽量准确。
                 if (subscriptions.hasPatternSubscription()) {
                     // For consumer group that uses pattern-based subscription, after a topic is created,
                     // any consumer that discovers the topic after metadata refresh can trigger rebalance
@@ -540,41 +560,51 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
                     // reduce the number of rebalances caused by single topic creation by asking consumer to
                     // refresh metadata before re-joining the group as long as the refresh backoff time has
                     // passed.
+                    // 检查元数据刷新退避时间是否已经结束，现在是否允许刷新。
                     if (this.metadata.timeToAllowUpdate(timer.currentTimeMs()) == 0) {
+                        // 请求强制刷新集群元数据。
                         this.metadata.requestUpdate(true);
                     }
-
+                    // 等待获取最新元数据。如果在剩余时间内没有拿到，返回 false。
                     if (!client.ensureFreshMetadata(timer)) {
                         return false;
                     }
 
+                    // 用刚拿到的新元数据重新匹配主题，并更新订阅快照。
                     maybeUpdateSubscriptionMetadata();
                 }
 
                 // if not wait for join group, we would just use a timer of 0
+                // waitForJoinGroup 决定是否等待入组完成：
+                // true：使用原来的 timer，允许等待。
+                // false：使用 0 毫秒计时器，只推进现有流程，不阻塞等待。
                 if (!ensureActiveGroup(waitForJoinGroup ? timer : time.timer(0L))) {
                     // since we may use a different timer in the callee, we'd still need
                     // to update the original timer's current time after the call
                     timer.update(time.milliseconds());
-
+                    // 本轮还没有成功完成入组，通知调用者暂时不能继续。
                     return false;
                 }
             }
-        } else {
+        } else {    // 进入这里说明不是自动分配，而是通过 assign() 手动指定分区，不需要加入消费组。
             // For manually assigned partitions, we do not try to pro-actively lookup coordinator;
             // instead we only try to refresh metadata when necessary.
             // If connections to all nodes fail, wakeups triggered while attempting to send fetch
             // requests result in polls returning immediately, causing a tight loop of polls. Without
             // the wakeup, poll() with no channels would block for the timeout, delaying re-connection.
             // awaitMetadataUpdate() in ensureCoordinatorReady initiates new connections with configured backoff and avoids the busy loop.
+            // 如果需要刷新元数据，并且当前没有任何可用的 Broker 连接，就主动等待元数据更新。
             if (metadata.updateRequested() && !client.hasReadyNodes(timer.currentTimeMs())) {
+                // 在剩余超时时间内尝试连接 Broker 并获取元数据，避免调用方不断快速空转。
                 client.awaitMetadataUpdate(timer);
             }
 
             // if there is pending coordinator requests, ensure they have a chance to be transmitted.
+            // 执行一次不会被 wakeup() 中断的网络轮询，让待发送的协调器请求、提交请求等有机会真正发出去或收到响应。
             client.pollNoWakeup();
         }
 
+        // 如果开启了自动提交，并且已经到达提交周期，就异步提交当前消费位点。
         maybeAutoCommitOffsetsAsync(timer.currentTimeMs());
         return true;
     }
@@ -912,30 +942,49 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
     }
 
     /**
+     * 当前消费者是否需要重新加入消费组，或者已经有一个入组请求正在处理中。
+     * 需要重新入组的主要情况：
+     * 1)集群元数据发生变化，例如主题新增了分区。
+     * 2)消费者订阅的主题发生变化。
+     * 3)其他地方已经要求重新入组。
+     * 4)已经发起入组请求，但还没有处理完成。
      * @throws KafkaException if the callback throws exception
      */
     @Override
     public boolean rejoinNeededOrPending() {
+        // 判断消费者是否没有使用 subscribe() 自动分配分区。
         if (!subscriptions.hasAutoAssignedPartitions())
+            // 如果使用的是 assign() 手动分配分区，就不需要加入消费组，也不需要重平衡，直接返回 false。
             return false;
 
         // we need to rejoin if we performed the assignment and metadata has changed;
         // also for those owned-but-no-longer-existed partitions we should drop them as lost
+        // 检查上次分区分配时的元数据快照，是否和当前最新的元数据快照不一致。例如：
+        // 主题新增或删除了分区。
+        // 某些之前分配的分区已经不存在。
+        // 正则订阅匹配到的主题发生变化。
+        // assignmentSnapshot != null 表示之前已经进行过分区分配。
         if (assignmentSnapshot != null && !assignmentSnapshot.matches(metadataSnapshot)) {
             final String fullReason = String.format("cached metadata has changed from %s at the beginning of the rebalance to %s",
                 assignmentSnapshot, metadataSnapshot);
+            // 生成详细的重新入组原因，记录旧元数据和当前元数据，主要用于日志和问题排查。
             requestRejoinIfNecessary("cached metadata has changed", fullReason);
+            // 通知协调器：元数据发生变化，需要重新加入消费组并重新分配分区。
+            // 如果之前已经申请过重新入组，该方法会避免重复申请。
             return true;
         }
 
         // we need to join if our subscription has changed since the last join
+        // 确认需要重新入组。
         if (joinedSubscription != null && !joinedSubscription.equals(subscriptions.subscription())) {
             final String fullReason = String.format("subscription has changed from %s at the beginning of the rebalance to %s",
                 joinedSubscription, subscriptions.subscription());
+            // 生成详细原因，记录之前和现在分别订阅了哪些主题。
             requestRejoinIfNecessary("subscription has changed", fullReason);
+            // 通知协调器：订阅内容发生变化，需要重新加入消费组并重新分配分区。
             return true;
         }
-
+        // 确认需要重新入组
         return super.rejoinNeededOrPending();
     }
 
@@ -1035,6 +1084,10 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
     }
 
     // visible for testing
+
+    /**
+     * 处理已经完成的异步位点提交，并调用对应的回调函数。如果消费者被 fenced，也会在这里抛出异常。
+     */
     void invokeCompletedOffsetCommitCallbacks() {
         if (asyncCommitFenced.get()) {
             throw new FencedInstanceIdException("Get fenced exception for group.instance.id "

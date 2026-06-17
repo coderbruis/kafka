@@ -75,6 +75,8 @@ public class FetchCollector<K, V> {
     }
 
     /**
+     * 从 FetchBuffer 里取出已经 fetch 回来的数据，把 CompletedFetch 解析成用户可见的 ConsumerRecord，组装成 Fetch<K, V> 返回，同时推进消费位置。
+     *
      * Return the fetched {@link ConsumerRecord records}, empty the {@link FetchBuffer record buffer}, and
      * update the consumed position.
      *
@@ -90,19 +92,24 @@ public class FetchCollector<K, V> {
      */
     public Fetch<K, V> collectFetch(final FetchBuffer fetchBuffer) {
         final Fetch<K, V> fetch = Fetch.empty();
+        // 临时保存“分区已经暂停”的 fetch 数据。
+        // 暂停的分区不能返回 records，但数据不能丢，所以稍后放回 FetchBuffer。
         final Queue<CompletedFetch> pausedCompletedFetches = new ArrayDeque<>();
+        // 本次最多还能返回多少条记录，对应配置max.poll.records。
         int recordsRemaining = fetchConfig.maxPollRecords;
 
         try {
             while (recordsRemaining > 0) {
+                // 拿当前正在处理的 CompletedFetch。
+                // 一个 CompletedFetch 可能包含很多 records，本次 poll 不一定一次取完，所以需要 nextInLineFetch 保存“处理到一半”的 fetch。
                 final CompletedFetch nextInLineFetch = fetchBuffer.nextInLineFetch();
-
+                // 如果当前没有正在处理的 fetch，或者当前 fetch 已经消费完了，就准备从 buffer 队列里拿新的。
                 if (nextInLineFetch == null || nextInLineFetch.isConsumed()) {
                     final CompletedFetch completedFetch = fetchBuffer.peek();
 
                     if (completedFetch == null)
                         break;
-
+                    // 如果这个 CompletedFetch 还没初始化，就先初始化。
                     if (!completedFetch.isInitialized()) {
                         try {
                             fetchBuffer.setNextInLineFetch(initialize(completedFetch));
@@ -112,6 +119,9 @@ public class FetchCollector<K, V> {
                             // The first condition ensures that the completedFetches is not stuck with the same completedFetch
                             // in cases such as the TopicAuthorizationException, and the second condition ensures that no
                             // potential data loss due to an exception in a following record.
+
+                            // 如果当前还没有收集到任何 records，并且这个异常 fetch 本身没有实际消息内容，就把它从 buffer 移除。
+                            // 目的：避免下次 poll 又卡在同一个异常 fetch 上。
                             if (fetch.isEmpty() && FetchResponse.recordsOrFail(completedFetch.partitionData).sizeInBytes() == 0)
                                 fetchBuffer.poll();
 
@@ -123,6 +133,15 @@ public class FetchCollector<K, V> {
 
                     fetchBuffer.poll();
                 } else if (subscriptions.isPaused(nextInLineFetch.partition)) {
+                    // 常见场景：
+                    // 1)业务处理不过来
+                    //  某个分区消息很多，应用想先暂停它，等处理完积压后再 resume(...)。
+                    // 2)按分区做限流
+                    //  比如某个分区对应的下游服务慢了，只暂停这个分区，不影响其他分区继续消费。
+                    // 3)异步处理时防止拉太多
+                    //  应用 poll 到消息后异步处理，为了避免同一分区继续返回更多消息，可以先 pause，处理完成后再 resume。
+                    // 4)临时跳过某些分区
+                    //  比如某个分区的数据暂时有问题，应用想先消费其他分区
                     // when the partition is paused we add the records back to the completedFetches queue instead of draining
                     // them so that they can be returned on a subsequent poll if the partition is resumed at that time
                     log.debug("Skipping fetching records for assigned partition {} because it is paused", nextInLineFetch.partition);
@@ -146,9 +165,14 @@ public class FetchCollector<K, V> {
         return fetch;
     }
 
+    /**
+     * 从一个已经初始化好的 CompletedFetch 里读取 records，确认这些 records 还能返回给当前 consumer，
+     * 然后更新分区消费位置和指标，最后包装成 Fetch 返回。
+     */
     private Fetch<K, V> fetchRecords(final CompletedFetch nextInLineFetch, int maxRecords) {
         final TopicPartition tp = nextInLineFetch.partition;
-
+        // 检查这个分区是否还分配给当前 consumer。
+        // 如果 rebalance 已经发生，这批数据可能是旧 assignment 时 fetch 回来的。
         if (!subscriptions.isAssigned(tp)) {
             // this can happen when a rebalance happened before fetched records are returned to the consumer's poll call
             log.debug("Not returning fetched records for partition {} since it is no longer assigned", tp);
@@ -164,53 +188,69 @@ public class FetchCollector<K, V> {
 
             if (position == null)
                 throw new IllegalStateException("Missing position for fetchable partition " + tp);
-
+            // 防止过期fetch请求的数据
             if (nextInLineFetch.nextFetchOffset() == position.offset) {
+                // 从nextInLineFetch中读取数据并反序列化
                 List<ConsumerRecord<K, V>> partRecords = nextInLineFetch.fetchRecords(fetchConfig,
                         deserializers,
                         maxRecords);
 
                 log.trace("Returning {} fetched records at offset {} for assigned partition {}",
                         partRecords.size(), position, tp);
-
+                // 记录本次是否推进了消费位置。
                 boolean positionAdvanced = false;
-
+                // 如果读取 records 后(nextFetchOffset会加1)，CompletedFetch 的 next offset 比原 position 大，说明确实消费到了 records。
                 if (nextInLineFetch.nextFetchOffset() > position.offset) {
+                    // 构造新的消费位置
                     SubscriptionState.FetchPosition nextPosition = new SubscriptionState.FetchPosition(
                             nextInLineFetch.nextFetchOffset(),
                             nextInLineFetch.lastEpoch(),
                             position.currentLeader);
                     log.trace("Updating fetch position from {} to {} for partition {} and returning {} records from `poll()`",
                             position, nextPosition, tp, partRecords.size());
+                    // 更新消费位置
                     subscriptions.position(tp, nextPosition);
+                    // 标记position已经前进。
                     positionAdvanced = true;
                 }
 
                 // Drain after position update to ensure the background thread sees the updated position
                 // before it sees isConsumed=true. This prevents duplicate fetch requests for the old offset.
+                // 注释里强调先更新 position，再 drain，是为了让后台线程先看到新 position，避免重复按旧 offset 发 fetch。
+                // 这批CompleteFetch读完，就标记为consumed
                 if (nextInLineFetch.isExhausted()) {
+                    // 标记为consumed
                     nextInLineFetch.drain();
                 }
 
+                // 计算当前分区 lag。lag表示：当前消费位置距离 high watermark / last stable offset 还有多远。
                 Long partitionLag = subscriptions.partitionLag(tp, fetchConfig.isolationLevel);
                 if (partitionLag != null)
                     metricsManager.recordPartitionLag(tp, partitionLag);
 
+                // 计算 partition lead。lead表示当前消费位置距离 log start offset 的距离。
                 Long lead = subscriptions.partitionLead(tp);
                 if (lead != null) {
                     metricsManager.recordPartitionLead(tp, lead);
                 }
-
+                // 把这个分区读到的 records 包装成 Fetch 返回。
                 return Fetch.forPartition(tp, partRecords, positionAdvanced, new OffsetAndMetadata(nextInLineFetch.nextFetchOffset(), nextInLineFetch.lastEpoch(), ""));
             } else {
                 // these records aren't next in line based on the last consumed position, ignore them
                 // they must be from an obsolete request
+                // 这批数据是过期 fetch 请求的结果，不能返回。
+                // 例如：
+                // 1)用户 seek 过。
+                // 2)offset reset 过。
+                // 3)rebalance 后 position 变了。
+                // 4)旧请求响应回来得太晚。
                 log.debug("Ignoring fetched records for {} at offset {} since the current position is {}",
                         tp, nextInLineFetch.nextFetchOffset(), position);
             }
         }
 
         log.trace("Draining fetched records for partition {}", tp);
+        // 丢弃这批不能返回的数据，标记为 consumed。
         nextInLineFetch.drain();
 
         return Fetch.empty();

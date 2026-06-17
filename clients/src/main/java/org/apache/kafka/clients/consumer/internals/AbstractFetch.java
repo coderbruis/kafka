@@ -141,6 +141,9 @@ public abstract class AbstractFetch implements Closeable {
     }
 
     /**
+     * 处理 broker 返回的 Fetch 成功响应，
+     * 把每个分区返回的数据包装成 CompletedFetch 放进本地 fetchBuffer，同时维护 fetch session、leader 变更、offset 校验和 fetch 请求状态。
+     * <p>
      * Implements the core logic for a successful fetch response.
      *
      * @param fetchTarget {@link Node} from which the fetch data was requested
@@ -153,6 +156,7 @@ public abstract class AbstractFetch implements Closeable {
                                       final ClientResponse resp) {
         try {
             final FetchResponse response = (FetchResponse) resp.responseBody();
+            // 找到这个 broker 对应的 fetch session 管理器。
             final FetchSessionHandler handler = sessionHandler(fetchTarget.id());
 
             if (handler == null) {
@@ -163,8 +167,14 @@ public abstract class AbstractFetch implements Closeable {
 
             final short requestVersion = resp.requestHeader().apiVersion();
 
+            // 更新 session 状态，并判断这个响应是否可继续处理。
             if (!handler.handleResponse(response, requestVersion)) {
+                // topic id 相关的 fetch session 状态对不上。这种情况通常说明客户端本地的 metadata 可能旧了，比如：
+                // 1) topic 被删除后又重建，topic name 一样但 topic id 变了；
+                // 2) broker 端看到的 topic id 和 client 本地缓存的不一致；
+                // 3) fetch session 里缓存的 topic-partition/topic-id 映射失效了。
                 if (response.error() == Errors.FETCH_SESSION_TOPIC_ID_ERROR) {
+                    // 请求刷新 metadata，重新拿最新的 topic id、leader、partition 信息。
                     metadata.requestUpdate(false);
                 }
 
@@ -175,6 +185,7 @@ public abstract class AbstractFetch implements Closeable {
             final Set<TopicPartition> partitions = new HashSet<>(responseData.keySet());
             final FetchMetricsAggregator metricAggregator = new FetchMetricsAggregator(metricsManager, partitions);
 
+            // 默认认为需要唤醒 fetch buffer，避免没有数据时调用方一直等。
             boolean needsWakeup = true;
 
             Map<TopicPartition, Metadata.LeaderIdAndEpoch> partitionsWithUpdatedLeaderInfo = new HashMap<>();
@@ -182,6 +193,7 @@ public abstract class AbstractFetch implements Closeable {
                 TopicPartition partition = entry.getKey();
                 FetchRequest.PartitionData requestData = data.sessionPartitions().get(partition);
 
+                // broker 的 FetchResponse 里返回了某个分区，但客户端这次 FetchRequest 里没有请求这个分区。
                 if (requestData == null) {
                     String message;
 
@@ -196,6 +208,7 @@ public abstract class AbstractFetch implements Closeable {
                     }
 
                     // Received fetch response for missing session partition
+                    // 这里防的是“broker 给了我一个我这次没要、也不在当前 fetch session 里的分区结果”，这是协议/session 状态异常，不是业务上的没数据。
                     throw new IllegalStateException(message);
                 }
 
@@ -222,36 +235,44 @@ public abstract class AbstractFetch implements Closeable {
                         partitionData,
                         metricAggregator,
                         fetchOffset);
+                // 把完成的分区 fetch 结果放进本地缓冲区，等待后续 collectFetch() 返回给用户。
                 fetchBuffer.add(completedFetch);
+                // 已经放入 fetch 数据了，不需要额外唤醒空 buffer。
                 needsWakeup = false;
             }
 
             // "Wake" the fetch buffer on any response, even if it's empty, to allow the consumer to not block
             // indefinitely waiting on the fetch buffer to get data.
+            // 如果响应里没有任何可加入 buffer 的分区，也要唤醒等待方，避免它一直阻塞等数据。
             if (needsWakeup)
                 fetchBuffer.wakeup();
 
+            // 如果本次 fetch 响应里发现了新的 leader 信息，就处理 metadata 更新。
             if (!partitionsWithUpdatedLeaderInfo.isEmpty()) {
                 List<Node> leaderNodes = new ArrayList<>();
 
                 for (FetchResponseData.NodeEndpoint e : response.data().nodeEndpoints()) {
                     Node node = new Node(e.nodeId(), e.host(), e.port(), e.rack());
 
+                    // 过滤无效节点，只保存有效 broker 节点。fetch响应如果找不到leader，会返回noNode节点。
                     if (!node.equals(Node.noNode()))
                         leaderNodes.add(node);
                 }
-
+                // 用 broker 返回的新 leader 信息更新本地 metadata，并拿到实际更新成功的分区集合。
                 Set<TopicPartition> updatedPartitions = metadata.updatePartitionLeadership(partitionsWithUpdatedLeaderInfo, leaderNodes);
                 updatedPartitions.forEach(
                     tp -> {
                         log.debug("For {}, as the leader was updated, position will be validated.", tp);
+                        // 标记或触发该分区基于新 leader 的 offset position 校验，防止继续用已经不合法的位置拉取。
                         subscriptions.maybeValidatePositionForCurrentLeader(apiVersions, tp, metadata.currentLeader(tp));
                     }
                 );
             }
-
+            // 记录这次 fetch 请求到该 broker 的延迟指标。
             metricsManager.recordLatency(resp.destination(), resp.requestLatencyMs());
         } finally {
+            // 无论成功处理还是中途异常，都移除“这个 broker 上有 fetch 请求正在进行”的标记。
+            // 这样后续才能继续给这个 broker 发送新的 fetch 请求。
             removePendingFetchRequest(fetchTarget, data.metadata().sessionId());
         }
     }
@@ -609,6 +630,20 @@ public abstract class AbstractFetch implements Closeable {
     }
 
     // Visible for testing
+
+    /**
+     * sessionHandler 是 consumer 维护“和某个 broker 的 fetch 会话”的状态机。
+     * handleFetchSuccess() 必须先拿到它，才能判断 FetchResponse 是否有效、更新 session 状态，并正确解析 broker 返回的数据。
+     * FetchSessionHandler 就是客户端这边负责记账的人。它主要记录和处理：
+     * 1) 当前这个 broker 上有哪些分区在 fetch session 里
+     * 2) 下次请求是 full fetch 还是 incremental fetch
+     * 3) 哪些分区要新增、删除、替换
+     * 4) broker 返回的 session id 是否有效
+     * 5) fetch session 出错时是否需要重建
+     * 6) 响应里的 topic id / partition 数据如何还原成 TopicPartition
+     *
+     * sessionId是broker返回的，在FetchSessionCacheShard.newSessionId()返回
+     */
     protected FetchSessionHandler sessionHandler(int node) {
         return sessionHandlers.get(node);
     }

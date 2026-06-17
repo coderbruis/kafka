@@ -358,6 +358,8 @@ public abstract class AbstractCoordinator implements Closeable {
     }
 
     /**
+     * 检查心跳线程状态、唤醒需要发送心跳的线程，并记录本次调用时间，告诉 Kafka：“消费者应用仍然活着”。
+     * <p>
      * Check the status of the heartbeat thread (if it is active) and indicate the liveness
      * of the client. This must be called periodically after joining with {@link #ensureActiveGroup()}
      * to ensure that the member stays in the group. If an interval of time longer than the
@@ -406,6 +408,11 @@ public abstract class AbstractCoordinator implements Closeable {
     }
 
     /**
+     * 确保消费组处于可用状态，核心工作包括：
+     * 1)找到并连接协调器。
+     * 2)启动心跳线程。
+     * 3)必要时发送 JoinGroup/SyncGroup 请求完成分区分配。
+     * <p>
      * Ensure the group is active (i.e., joined and synced)
      *
      * @param timer Timer bounding how long this method can block
@@ -415,11 +422,13 @@ public abstract class AbstractCoordinator implements Closeable {
     boolean ensureActiveGroup(final Timer timer) {
         // always ensure that the coordinator is ready because we may have been disconnected
         // when sending heartbeats and does not necessarily require us to rejoin the group.
+        // 找到并连接协调器
         if (!ensureCoordinatorReady(timer)) {
             return false;
         }
-
+        // 启动心跳线程
         startHeartbeatThreadIfNeeded();
+        // 必要时发送 JoinGroup/SyncGroup 请求完成分区分配。
         return joinGroupIfNeeded(timer);
     }
 
@@ -448,6 +457,8 @@ public abstract class AbstractCoordinator implements Closeable {
     }
 
     /**
+     * 如果当前消费者需要加入或重新加入消费组，就循环推进整个入组/重平衡流程，直到成功、超时、需要稍后重试，或者遇到不可恢复异常。
+     * <p>
      * Joins the group without starting the heartbeat thread.
      *
      * If this function returns true, the state must always be in STABLE and heartbeat enabled.
@@ -463,7 +474,9 @@ public abstract class AbstractCoordinator implements Closeable {
      * @return true iff the operation succeeded
      */
     boolean joinGroupIfNeeded(final Timer timer) {
+        // 只要“需要重新入组”或者“已有入组请求还没处理完”，就继续执行入组流程。
         while (rejoinNeededOrPending()) {
+            // 确认消费组 coordinator 是否已经可用；如果不可用，就尝试寻找并连接。
             if (!ensureCoordinatorReady(timer)) {
                 return false;
             }
@@ -473,11 +486,14 @@ public abstract class AbstractCoordinator implements Closeable {
             // on each iteration of the loop because an event requiring a rebalance (such as a metadata
             // refresh which changes the matched subscription set) can occur while another rebalance is
             // still in progress.
+            // 判断是否需要执行入组前准备逻辑。通常包括：提交 offset、触发分区撤销回调等。
             if (needsJoinPrepare) {
                 // need to set the flag before calling onJoinPrepare since the user callback may throw
                 // exception, in which case upon retry we should not retry onJoinPrepare either.
+                // 避免准备逻辑被重复执行。
                 needsJoinPrepare = false;
                 // return false when onJoinPrepare is waiting for committing offset
+                // 在消费者里，这通常会处理 rebalance 前的 offset 提交和 revoke 回调。
                 if (!onJoinPrepare(timer, generation.generationId, generation.memberId)) {
                     needsJoinPrepare = true;
                     //should not initiateJoinGroup if needsJoinPrepare still is true
@@ -485,7 +501,10 @@ public abstract class AbstractCoordinator implements Closeable {
                 }
             }
 
+            // 发起入组流程，返回一个 future。这个 future 最终会拿到 SyncGroup 返回的分区分配结果。
             final RequestFuture<ByteBuffer> future = initiateJoinGroup();
+            // 轮询网络请求，等待 JoinGroup / SyncGroup 完成，直到 future 完成或 timer 超时。
+            // 循环poll等待future完成，并且允许wakeup唤醒poll
             client.poll(future, timer);
             if (!future.isDone()) {
                 // we ran out of time
@@ -493,39 +512,51 @@ public abstract class AbstractCoordinator implements Closeable {
             }
 
             if (future.succeeded()) {
+                // 声明变量，用来保存当前 generation 信息快照。generation 表示当前消费组的一代，包括 generation id、member id、协议名。
                 Generation generationSnapshot;
+                // 声明变量，用来保存当前成员状态快照。
                 MemberState stateSnapshot;
 
                 // Generation data maybe concurrently cleared by Heartbeat thread.
                 // Can't use synchronized for {@code onJoinComplete}, because it can be long enough
                 // and shouldn't block heartbeat thread.
                 // See {@link PlaintextConsumerTest#testMaxPollIntervalMsDelayInAssignment}
+                // 加锁读取状态，避免心跳线程同时修改 generation 或 state。
                 synchronized (AbstractCoordinator.this) {
                     generationSnapshot = this.generation;
                     stateSnapshot = this.state;
                 }
 
+                // 确认当前 generation 没被重置，并且成员状态已经是 STABLE。
+                // 也就是说：这次重平衡确实成功完成了。
                 if (!hasGenerationReset(generationSnapshot) && stateSnapshot == MemberState.STABLE) {
                     // Duplicate the buffer in case `onJoinComplete` does not complete and needs to be retried.
+                    // 复制一份分区分配结果。
+                    // 这样如果 onJoinComplete() 没执行完、后续需要重试，不会因为原 buffer 位置变化导致数据读不到。
                     ByteBuffer memberAssignment = future.value().duplicate();
 
+                    // 执行入组完成后的逻辑。
+                    // 在消费者里，这一步会应用新的分区分配结果，并触发 assigned 回调。
                     onJoinComplete(generationSnapshot.generationId, generationSnapshot.memberId, generationSnapshot.protocolName, memberAssignment);
 
                     // Generally speaking we should always resetJoinGroupFuture once the future is done, but here
                     // we can only reset the join group future after the completion callback returns. This ensures
                     // that if the callback is woken up, we will retry it on the next joinGroupIfNeeded.
                     // And because of that we should explicitly trigger resetJoinGroupFuture in other conditions below.
+                    // 清空当前 join future，表示这次入组请求已经处理完。
                     resetJoinGroupFuture();
+                    // 把准备标记恢复为 true，为下一次重平衡做准备。
                     needsJoinPrepare = true;
-                } else {
+                } else { // 如果 generation 被重置，或者状态不是 STABLE，说明这次重平衡结果已经不可靠。
                     final String reason = String.format("rebalance failed since the generation/state was " +
                             "modified by heartbeat thread to %s/%s before the rebalance callback triggered",
                             generationSnapshot, stateSnapshot);
-
+                    // 重置状态，并请求再次重新加入消费组。
                     resetStateAndRejoin(reason, true);
+                    // 清空这次 join future，避免继续使用已经失败的请求结果。
                     resetJoinGroupFuture();
                 }
-            } else {
+            } else {    // future完成，但是结果失败
                 final RuntimeException exception = future.exception();
 
                 resetJoinGroupFuture();
@@ -597,6 +628,11 @@ public abstract class AbstractCoordinator implements Closeable {
     }
 
     /**
+     * 构造并发送 JoinGroup 请求，让当前消费者加入或重新加入消费组，然后返回一个 future，用来等待后续 JoinGroup / SyncGroup 的最终结果。
+     * 注意：虽然方法名叫 sendJoinGroupRequest()，但它返回的 future 后面会继续串上 JoinGroupResponseHandler。
+     * 成功收到 JoinGroup 响应后，handler 还会继续推进 SyncGroup，所以这个 future 最终包装的是“本次入组后拿到的分区分配结果”。
+     *
+     * <p>
      * Join the group and return the assignment for the next generation. This function handles both
      * JoinGroup and SyncGroup, delegating to {@link #onLeaderElected(String, String, List, boolean)} if
      * elected leader by the coordinator.
@@ -606,6 +642,7 @@ public abstract class AbstractCoordinator implements Closeable {
      * @return A request future which wraps the assignment returned from the group leader
      */
     RequestFuture<ByteBuffer> sendJoinGroupRequest() {
+        // 检查当前是否还不知道消费组 coordinator 是哪个 Broker。
         if (coordinatorUnknown())
             return RequestFuture.coordinatorNotAvailable();
 
@@ -613,12 +650,12 @@ public abstract class AbstractCoordinator implements Closeable {
         log.info("(Re-)joining group");
         JoinGroupRequest.Builder requestBuilder = new JoinGroupRequest.Builder(
                 new JoinGroupRequestData()
-                        .setGroupId(rebalanceConfig.groupId)
-                        .setSessionTimeoutMs(this.rebalanceConfig.sessionTimeoutMs)
+                        .setGroupId(rebalanceConfig.groupId)    // 消费者组id
+                        .setSessionTimeoutMs(this.rebalanceConfig.sessionTimeoutMs) // session timeout。如果 broker 在这个时间内收不到心跳，就认为该消费者掉线。
                         .setMemberId(this.generation.memberId)
                         .setGroupInstanceId(this.rebalanceConfig.groupInstanceId.orElse(null))
-                        .setProtocolType(protocolType())
-                        .setProtocols(metadata())
+                        .setProtocolType(protocolType())    // 协议类型。一般都是consumer
+                        .setProtocols(metadata())   // 设置该消费者支持的分区分配协议和订阅元数据。比如支持哪些 assignor、订阅了哪些 topic、用户自定义数据等。
                         .setRebalanceTimeoutMs(this.rebalanceConfig.rebalanceTimeoutMs)
                         .setReason(JoinGroupRequest.maybeTruncateReason(this.rejoinReason))
         );
@@ -627,16 +664,25 @@ public abstract class AbstractCoordinator implements Closeable {
 
         // Note that we override the request timeout using the rebalance timeout since that is the
         // maximum time that it may block on the coordinator. We add an extra 5 seconds for small delays.
+        // JoinGroup 请求的超时时间
         int joinGroupTimeoutMs = Math.max(
-            client.defaultRequestTimeoutMs(),
-            Math.max(
-                rebalanceConfig.rebalanceTimeoutMs + JOIN_GROUP_TIMEOUT_LAPSE,
+            client.defaultRequestTimeoutMs(),       // 客户端默认请求超时时间。
+                Math.max(
+                rebalanceConfig.rebalanceTimeoutMs + JOIN_GROUP_TIMEOUT_LAPSE,  // rebalance timeout 再额外加一点缓冲时间。JOIN_GROUP_TIMEOUT_LAPSE 是为了容忍一些小延迟。
+                        // 这里主要是防止前面的加法溢出。如果 rebalanceTimeoutMs 已经非常大，加上缓冲值可能溢出变小。
                 rebalanceConfig.rebalanceTimeoutMs) // guard against overflow since rebalance timeout can be MAX_VALUE
             );
+        // 在指定超时时间内把JoinGroup请求发给coordinator，还绑定了个JoinGroupResponseHandler处理器
         return client.send(coordinator, requestBuilder, joinGroupTimeoutMs)
                 .compose(new JoinGroupResponseHandler(generation));
     }
 
+    /**
+     * 这个 handler 会处理 JoinGroup 响应：
+     * 1)如果当前成员是 leader，计算分区分配并发送 SyncGroup。
+     * 2)如果是 follower，发送空 assignment 的 SyncGroup。
+     * 3)最终把 SyncGroup 返回的分区分配结果放进 future。
+     */
     private class JoinGroupResponseHandler extends CoordinatorResponseHandler<JoinGroupResponse, ByteBuffer> {
         private JoinGroupResponseHandler(final Generation generation) {
             super(generation);

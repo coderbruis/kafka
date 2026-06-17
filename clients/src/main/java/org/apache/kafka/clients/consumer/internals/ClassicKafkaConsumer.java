@@ -704,10 +704,12 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
      * @return
      */
     boolean updateAssignmentMetadataIfNeeded(final Timer timer, final boolean waitForJoinGroup) {
+        // 判断消费者组协调是否完成（加入消费者组、重平衡、心跳协调）
         if (coordinator != null && !coordinator.poll(timer, waitForJoinGroup)) {
             return false;
         }
 
+        // 准备各分区的拉取位置，即consumer该从哪个offset开始拉消息
         return updateFetchPositions(timer);
     }
 
@@ -1205,6 +1207,14 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
     }
 
     /**
+     * 确保当前分配到的每个分区，都有一个明确的“下一次从哪里开始拉消息”的位置。
+     * 这个位置可能来自：
+     * 1)当前已经保存好的 fetch position。
+     * 2)已提交的 offset。
+     * 3)auto.offset.reset 策略，比如 earliest / latest。
+     * 4)手动 seek() 设置的位置。
+     * 如果在超时时间内拿不到需要的已提交 offset，就返回 false。如果缺少 offset 且没有配置 reset 策略，就会抛 NoOffsetForPartitionException。
+     * <p>
      * Set the fetch position to the committed position (if there is one)
      * or reset it using the offset reset policy the user has configured.
      *
@@ -1215,9 +1225,12 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
      */
     private boolean updateFetchPositions(final Timer timer) {
         // If any partitions have been truncated due to a leader change, we need to validate the offsets
+        // 检查已有的 fetch position 是否还有效。
         offsetFetcher.validatePositionsIfNeeded();
 
+        // 检查当前订阅状态里，所有已分配分区是否都有有效的 fetch position。
         cachedSubscriptionHasAllFetchPositions = subscriptions.hasAllFetchPositions();
+        // 如果所有分区都有位置了，就不需要再查 committed offset，也不需要 reset，直接返回成功。
         if (cachedSubscriptionHasAllFetchPositions) return true;
 
         // If there are any partitions which do not have a valid position and are not
@@ -1225,15 +1238,26 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
         // coordinator lookup if there are partitions which have missing positions, so
         // a consumer with manually assigned partitions can avoid a coordinator dependence
         // by always ensuring that assigned partitions have an initial position.
+        // 如果存在 consumer coordinator，就尝试为“还没有 fetch position 的分区”读取已提交 offset。也就是问 coordinator：这些分区之前消费到哪里了？
+        // 如果在 timer 时间内没有查到 committed offset，就返回 false，本轮先不继续。这里 coordinator != null 是因为：
+        // 1)自动分配分区时通常有 coordinator。
+        // 2)手动 assign() 的消费者也可能不依赖 coordinator。
+        // 3)如果没有 coordinator，就跳过 committed offset 初始化，后面走 reset 策略。
         if (coordinator != null && !coordinator.initWithCommittedOffsetsIfNeeded(timer)) return false;
 
         // If there are partitions still needing a position and a reset policy is defined,
         // request reset using the default policy. If no reset strategy is defined and there
         // are partitions with a missing position, then we will raise an exception.
+        // 对仍然没有 fetch position 的分区，按默认 offset reset 策略准备重置位置。
+        // 比如：
+        // 1)earliest：准备从最早 offset 开始。
+        // 2)latest：准备从最新 offset 开始。
+        // 3)none：没有可用 offset 时直接抛 NoOffsetForPartitionException。
         subscriptions.resetInitializingPositions();
 
         // Finally send an asynchronous request to look up and update the positions of any
         // partitions which are awaiting reset.
+        // 对刚才标记为需要 reset 的分区，异步发送 ListOffsets 请求，去 broker 查询真正的 earliest/latest offset，并更新 fetch position。
         offsetFetcher.resetPositionsIfNeeded();
 
         return true;

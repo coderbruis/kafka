@@ -50,6 +50,7 @@ import java.util.function.Predicate;
 public class FetchBuffer implements AutoCloseable {
 
     private final Logger log;
+    // 队列：还没开始处理的一批批 fetch 结果
     private final ConcurrentLinkedQueue<CompletedFetch> completedFetches;
     private final Lock lock;
     private final Condition blockingCondition;
@@ -57,6 +58,9 @@ public class FetchBuffer implements AutoCloseable {
 
     private final AtomicBoolean wokenup = new AtomicBoolean(false);
 
+    // nextInLineFetch 是为了保存 当前正在被消费、但还没完全消费完的 CompletedFetch。
+    // nextInLineFetch 是 FetchBuffer 里的“当前游标”。
+    // 它保存已经从队列取出、正在解析返回给用户、但可能还没读完的一批 fetch 数据，用来保证不丢数据、不乱序，并支持 max.poll.records 和 pause 场景。
     private CompletedFetch nextInLineFetch;
 
     public FetchBuffer(final LogContext logContext) {

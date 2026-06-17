@@ -63,6 +63,7 @@ public class FetchSessionHandler {
     private final int node;
 
     /**
+     * FetchMetadata.INITIAL => 表明初始状态为全量拉取
      * The metadata for the next fetch request.
      */
     private FetchMetadata nextMetadata = FetchMetadata.INITIAL;
@@ -272,6 +273,13 @@ public class FetchSessionHandler {
             }
         }
 
+        /**
+         * FetchSessionHandler 初始 nextMetadata = INITIAL
+         * → Builder.build() 看到 isFull() = true，构建 full fetch
+         * → broker 返回 sessionId
+         * → handleResponse() 设置 nextMetadata = newIncremental(sessionId)
+         * → 下一次 Builder.build() 看到 isFull() = false，构建 incremental fetch
+         */
         public FetchRequestData build() {
             boolean canUseTopicIds = partitionsWithoutTopicIds == 0;
 
@@ -293,9 +301,14 @@ public class FetchSessionHandler {
                 return new FetchRequestData(toSend, Collections.emptyList(), Collections.emptyList(), toSend, nextMetadata, canUseTopicIds);
             }
 
+            // 已下是增量拉取消息
+            // 新增的分区
             List<TopicIdPartition> added = new ArrayList<>();
+            // 移除的分区
             List<TopicIdPartition> removed = new ArrayList<>();
+            // 参数变化的分区
             List<TopicIdPartition> altered = new ArrayList<>();
+            // topic id替换的分区
             List<TopicIdPartition> replaced = new ArrayList<>();
             for (Iterator<Entry<TopicPartition, PartitionData>> iter =
                  sessionPartitions.entrySet().iterator(); iter.hasNext(); ) {
@@ -536,6 +549,7 @@ public class FetchSessionHandler {
             return false;
         }
         Set<TopicPartition> topicPartitions = response.responseData(sessionTopicNames, version).keySet();
+        // fetch第一次是拉全量
         if (nextMetadata.isFull()) {
             if (topicPartitions.isEmpty() && response.throttleTimeMs() > 0) {
                 // Normally, an empty full fetch response would be invalid.  However, KIP-219
@@ -566,6 +580,7 @@ public class FetchSessionHandler {
                 if (log.isDebugEnabled())
                     log.debug("Node {} sent a full fetch response that created a new incremental " +
                             "fetch session {}{}", node, response.sessionId(), responseDataToLogString(topicPartitions));
+                // 第一次拉全量之后，后续变为增量拉取
                 nextMetadata = FetchMetadata.newIncremental(response.sessionId());
                 return true;
             }

@@ -509,6 +509,9 @@ public class SubscriptionState {
         return topicPartitionState.isFetchable();
     }
 
+    /**
+     * 判断是否使用 subscribe() 让 Kafka 自动分配分区。
+     */
     public synchronized boolean hasAutoAssignedPartitions() {
         return this.subscriptionType == SubscriptionType.AUTO_TOPICS || this.subscriptionType == SubscriptionType.AUTO_PATTERN
                 || this.subscriptionType == SubscriptionType.AUTO_TOPICS_SHARE || this.subscriptionType == SubscriptionType.AUTO_PATTERN_RE2J;
