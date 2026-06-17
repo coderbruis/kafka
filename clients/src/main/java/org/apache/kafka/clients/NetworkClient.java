@@ -627,7 +627,9 @@ public class NetworkClient implements KafkaClient {
                 request,
                 send,
                 now);
+        // 将fetch请求存放到inFlightRequests中
         this.inFlightRequests.add(inFlightRequest);
+        // 把这个 fetch 请求对应的 NetworkSend 挂到目标 broker 连接对应的 KafkaChannel 上。
         selector.send(new NetworkSend(clientRequest.destination(), send));
     }
 

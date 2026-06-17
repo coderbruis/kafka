@@ -188,6 +188,7 @@ public class Fetcher<K, V> extends AbstractFetch {
         for (Map.Entry<Node, FetchSessionHandler.FetchRequestData> entry : fetchRequests.entrySet()) {
             final Node fetchTarget = entry.getKey();
             final FetchSessionHandler.FetchRequestData data = entry.getValue();
+            // 封装一层FetchRequest
             final FetchRequest.Builder request = createFetchRequest(fetchTarget, data);
             final RequestFuture<ClientResponse> responseFuture = client.send(fetchTarget, request);
 

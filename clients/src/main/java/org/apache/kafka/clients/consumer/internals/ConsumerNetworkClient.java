@@ -257,6 +257,8 @@ public class ConsumerNetworkClient implements Closeable {
     }
 
     /**
+     * 它是 consumer 侧网络推进器：把 unsent 里的请求尽量发给 NetworkClient，
+     * 驱动底层网络 I/O，处理响应/断连/超时/wakeup，最后把完成结果通知给上层 future。
      * Poll for any network IO.
      * @param timer Timer bounding how long this method can block
      * @param pollCondition Nullable blocking condition
@@ -271,21 +273,28 @@ public class ConsumerNetworkClient implements Closeable {
         lock.lock();
         try {
             // Handle async disconnects prior to attempting any sends
+            // 先执行上一次已经完成、但还没通知上层的请求回调。
             handlePendingDisconnects();
 
             // send all the requests we can send now
+            // 尝试把 unsent 里的请求发出去。
             long pollDelayMs = trySend(timer.currentTimeMs());
 
             // check whether the poll is still needed by the caller. Note that if the expected completion
             // condition becomes satisfied after the call to shouldBlock() (because of a fired completion
             // handler), the client will be woken up.
+            // 判断这次是否真的需要阻塞等网络。
             if (pendingCompletion.isEmpty() && (pollCondition == null || pollCondition.shouldBlock())) {
                 // if there are no requests in flight, do not block longer than the retry backoff
+                // 计算底层 NetworkClient.poll() 最多阻塞多久。
                 long pollTimeout = Math.min(timer.remainingMs(), pollDelayMs);
                 if (client.inFlightRequestCount() == 0)
+                    // 如果没有任何 in-flight 请求，说明现在没请求在路上，那就不要长时间阻塞，最多等 retryBackoffMs。
                     pollTimeout = Math.min(pollTimeout, retryBackoffMs);
+                // 真正驱动底层网络 I/O 的地方：
                 client.poll(pollTimeout, timer.currentTimeMs());
             } else {
+                // 非阻塞地推进一下网络 I/O
                 client.poll(0, timer.currentTimeMs());
             }
             timer.update();
@@ -293,7 +302,9 @@ public class ConsumerNetworkClient implements Closeable {
             // handle any disconnects by failing the active requests. note that disconnects must
             // be checked immediately following poll since any subsequent call to client.ready()
             // will reset the disconnect status
+            // 检查 unsent 请求对应的连接是否已经失败。
             checkDisconnects(timer.currentTimeMs());
+            // 如果允许 wakeup，就检查是否有其他线程调用了 consumer.wakeup()
             if (!disableWakeup) {
                 // trigger wakeups after checking for disconnects so that the callbacks will be ready
                 // to be fired on the next call to poll()
@@ -304,18 +315,22 @@ public class ConsumerNetworkClient implements Closeable {
 
             // try again to send requests since buffer space may have been
             // cleared or a connect finished in the poll
+            // 再尝试发送一次 unsent 请求。
+            // 为什么要第二次？ 因为刚才 client.poll(...) 可能完成了连接、释放了 buffer、清理了 in-flight 请求，使一些之前不能发送的请求现在可以发了。
             trySend(timer.currentTimeMs());
 
             // fail requests that couldn't be sent if they have expired
             failExpiredRequests(timer.currentTimeMs());
 
             // clean unsent requests collection to keep the map from growing indefinitely
+            // 清理 unsent 内部空集合，避免 map 一直膨胀。
             unsent.clean();
         } finally {
             lock.unlock();
         }
 
         // called without the lock to avoid deadlock potential if handlers need to acquire locks
+        // 执行完成回调。
         firePendingCompletedRequests();
 
         metadata.maybeThrowAnyException();

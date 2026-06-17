@@ -276,6 +276,13 @@ public class OffsetFetcher {
     }
 
     /**
+     * 对需要校验的分区，异步发送 OffsetsForLeaderEpoch 请求，确认当前 fetch position 在新 leader 上是否仍然有效，防止日志截断后继续从错误 offset 消费。
+     * leader 发生变化
+     * → 当前 offset 可能在新 leader 上不存在或已截断
+     * → 分区进入 AWAIT_VALIDATION
+     * → validatePositionsAsync() 发请求校验
+     * → 成功后恢复 FETCHING，或发现截断后 reset / 抛异常
+     *
      * For each partition which needs validation, make an asynchronous request to get the end-offsets for the partition
      * with the epoch less than or equal to the epoch the partition last saw.
      *

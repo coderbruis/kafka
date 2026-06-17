@@ -436,6 +436,9 @@ public abstract class AbstractFetch implements Closeable {
     }
 
     /**
+     * 两个核心作用：
+     * 1) 它负责决定这次要向哪些 broker 发 FetchRequest、每个 broker 要拉哪些分区、从哪个 offset 开始拉。
+     * 2) 让每个 broker 的 fetch 请求进入它自己的 fetch session 管理流程，后续可以利用 fetch session 做增量 fetch，减少请求体大小，也避免重复传完整分区列表。
      * Create fetch requests for all nodes for which we have assigned partitions
      * that have no existing requests in flight.
      */

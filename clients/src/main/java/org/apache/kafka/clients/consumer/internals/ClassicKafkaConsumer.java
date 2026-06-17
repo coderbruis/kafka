@@ -643,6 +643,7 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
     }
 
     /**
+     * 在用户给定的超时时间内，完成消费组协调、分区位置准备、发送/接收 fetch 请求，并把拉到的消息返回给用户。
      * @throws KafkaException if the rebalance callback throws exception
      */
     private ConsumerRecords<K, V> poll(final Timer timer) {
@@ -656,6 +657,7 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
                 throw new IllegalStateException("Consumer is not subscribed to any topics or assigned any partitions");
             }
 
+            // 在超时时间范围内，只要没拿到数据就持续多轮poll
             do {
                 // 在可能发生阻塞操作前响应用户通过 wakeup() 发出的唤醒请求。
                 client.maybeTriggerWakeup();
@@ -663,8 +665,9 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
                 // try to update assignment metadata BUT do not need to block on the timer for join group
                 // 在拉取消息前，先确保消费者已经完成入组和分区分配，并准备好各分区接下来应该从哪个 offset 开始消费。
                 updateAssignmentMetadataIfNeeded(timer, false);
-
+                // 尝试从 fetch buffer 取数据；如果没有，就发送 fetch 请求并等待 broker 响应。
                 final Fetch<K, V> fetch = pollForFetches(timer);
+                // 如果本轮已经拿到可返回的数据，准备返回给用户
                 if (!fetch.isEmpty()) {
                     // before returning the fetched records, we can send off the next round of fetches
                     // and avoid block waiting for their responses to enable pipelining while the user
@@ -672,6 +675,7 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
                     //
                     // NOTE: since the consumed position has already been updated, we must not allow
                     // wakeups or any other errors to be triggered prior to returning the fetched records.
+                    // 提前发送下一轮 fetch 请求。用户处理当前 records 的时候，下一批数据已经在路上，提高吞吐，形成 pipeline。
                     if (sendFetches() > 0 || client.hasPendingRequests()) {
                         client.transmitSends();
                     }
@@ -680,14 +684,16 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
                         log.trace("Returning empty records from `poll()` "
                                 + "since the consumer's position has advanced for at least one topic partition");
                     }
-
+                    // 把拉到的数据交给 consumer interceptor 处理，然后包装成 ConsumerRecords 返回给用户。
                     return this.interceptors.onConsume(new ConsumerRecords<>(fetch.records(), fetch.nextOffsets()));
                 }
             } while (timer.notExpired());
 
             return ConsumerRecords.empty();
         } finally {
+            // 释放 consumer 使用权
             release();
+            // 记录 poll 结束指标
             this.kafkaConsumerMetrics.recordPollEnd(timer.currentTimeMs());
         }
     }
@@ -714,19 +720,23 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
     }
 
     /**
+     * 先从本地已完成的 fetch 结果里取数据；没有数据就发送新的 fetch 请求；再通过 client.poll() 推进网络 I/O，等待 broker 响应；最后再取一次数据返回。
      * @throws KafkaException if the rebalance callback throws exception
      */
     private Fetch<K, V> pollForFetches(Timer timer) {
+        // 计算这次最多阻塞多久。
         long pollTimeout = coordinator == null ? timer.remainingMs() :
                 Math.min(coordinator.timeToNextPoll(timer.currentTimeMs()), timer.remainingMs());
 
         // if data is available already, return it immediately
+        // 先看本地是否已经有可返回的数据。
         final Fetch<K, V> fetch = fetcher.collectFetch();
         if (!fetch.isEmpty()) {
             return fetch;
         }
 
         // send any new fetches (won't resend pending fetches)
+        // fetchBuffer中没有数据，发起fetch请求
         sendFetches();
 
         // We do not want to be stuck blocking in poll if we are missing some positions
@@ -734,20 +744,25 @@ public class ClassicKafkaConsumer<K, V> implements ConsumerDelegate<K, V> {
 
         // NOTE: the use of cachedSubscriptionHasAllFetchPositions means we MUST call
         // updateAssignmentMetadataIfNeeded before this method.
+        // 如果当前订阅的分区还不是全部都有有效 fetch position，就不要长时间阻塞等 fetch。
+        // 因为 position 不完整时，可能还在查 committed offset、reset offset、校验 leader epoch，或者刚失败进入 backoff。
         if (!cachedSubscriptionHasAllFetchPositions && pollTimeout > retryBackoffMs) {
+            // 这个时候等太久没意义，所以最多等 retryBackoffMs，尽快回到外层循环继续推进 position 准备流程。
             pollTimeout = retryBackoffMs;
         }
 
         log.trace("Polling for fetches with timeout {}", pollTimeout);
 
         Timer pollTimer = time.timer(pollTimeout);
+        // client.poll(...) 会推进 Kafka 网络 I/O：发送请求、接收响应、执行回调。
         client.poll(pollTimer, () -> {
             // since a fetch might be completed by the background thread, we need this poll condition
             // to ensure that we do not block unnecessarily in poll()
+            // 这个匿名参数是继续阻塞的条件：只要 fetcher 还没有可用 fetch，就可以继续等；一旦有 fetch 响应完成并进入可取状态，就提前结束等待，不必把 pollTimeout 用完。
             return !fetcher.hasAvailableFetches();
         });
         timer.update(pollTimer.currentTimeMs());
-
+        // fetch请求之后，再从fetcher收集一次数据。
         return fetcher.collectFetch();
     }
 
