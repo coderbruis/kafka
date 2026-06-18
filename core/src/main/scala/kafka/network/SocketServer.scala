@@ -160,55 +160,49 @@ class SocketServer(
   }
 
   /**
-   * This method enables request processing for all endpoints managed by this SocketServer. Each
-   * endpoint will be brought up asynchronously as soon as its associated future is completed.
-   * Therefore, we do not know that any particular request processor will be running by the end of
-   * this function -- just that it might be running.
-   *
-   * @param authorizerFutures     Future per [[Endpoint]] used to wait before starting the
-   *                              processor corresponding to the [[Endpoint]]. Any endpoint
-   *                              that does not appear in this map will be started once all
-   *                              authorizerFutures are complete.
-   *
-   * @return                      A future which is completed when all of the acceptor threads have
-   *                              successfully started. If any of them do not start, the future will
-   *                              be completed with an exception.
+   * 开启 SocketServer 管理的所有 endpoint 请求处理。
+   * 每个 endpoint 会在对应 authorizer ready 后异步启动 acceptor。
+   * 返回的 future 会在所有 acceptor 启动完成或任一启动失败时完成。
    */
   def enableRequestProcessing(
     authorizerFutures: Map[Endpoint, CompletableFuture[Void]]
   ): CompletableFuture[Void] = this.synchronized {
+    // SocketServer 已停止时禁止重新开启请求处理。
     if (stopped) {
       throw new RuntimeException("Can't enable request processing: SocketServer is stopped.")
     }
 
+    // 为单个 acceptor 绑定对应的 authorizer future，等授权器 ready 后再启动监听。
     def chainAcceptorFuture(acceptor: Acceptor): Unit = {
-      // Because of ephemeral ports, we need to match acceptors to futures by looking at
-      // the listener name, rather than the endpoint object.
+      // 临时端口会改变 endpoint 对象，所以按 listener 名称匹配 authorizer future。
       val authorizerFuture = authorizerFutures.find {
         case (endpoint, _) => acceptor.endPoint.listener.equals(endpoint.listener())
       } match {
+        // 没有专属 future 的 endpoint，等所有 authorizer 完成后再启动。
         case None => allAuthorizerFuturesComplete
+        // 有专属 future 的 endpoint，等待自己的 authorizer 完成。
         case Some((_, future)) => future
       }
       authorizerFuture.whenComplete((_, e) => {
         if (e != null) {
-          // If the authorizer failed to start, fail the acceptor's startedFuture.
+          // authorizer 启动失败时，让对应 acceptor 启动结果也失败。
           acceptor.startedFuture.completeExceptionally(e)
         } else {
-          // Once the authorizer has started, attempt to start the associated acceptor. The Acceptor.start()
-          // function will complete the acceptor started future (either successfully or not)
+          // authorizer ready 后启动 acceptor，由 acceptor 自己完成 startedFuture。
           acceptor.start()
         }
       })
     }
 
+    // 开始放开请求处理流程。
     info("Enabling request processing.")
+    // 为当前所有 data-plane acceptor 挂接启动条件。
     dataPlaneAcceptors.values().forEach(chainAcceptorFuture)
+    // 所有 authorizer future 完成后，唤醒未绑定专属 future 的 endpoint。
     FutureUtils.chainFuture(CompletableFuture.allOf(authorizerFutures.values.toArray: _*),
         allAuthorizerFuturesComplete)
 
-    // Construct a future that will be completed when all Acceptors have been successfully started.
-    // Alternately, if any of them fail to start, this future will be completed exceptionally.
+    // 汇总所有 acceptor 的启动结果，作为本方法返回的整体启动 future。
     val enableFuture = new CompletableFuture[Void]
     FutureUtils.chainFuture(CompletableFuture.allOf(dataPlaneAcceptors.values().asScala.toArray.map(_.startedFuture): _*), enableFuture)
     enableFuture
@@ -622,39 +616,44 @@ private[kafka] abstract class Acceptor(val socketServer: SocketServer,
   }
 
   /**
-   * Listen for new connections and assign accepted connections to processors using round-robin.
+   * 监听新连接，并把成功接收的连接按轮询方式分配给 Processor。
    */
   private def acceptNewConnections(): Unit = {
+    // 阻塞等待新连接事件，最多等待 500ms。
     val ready = nioSelector.select(500)
     if (ready > 0) {
+      // 获取本轮 selector 发现的可处理事件。
       val keys = nioSelector.selectedKeys()
       val iter = keys.iterator()
+      // 逐个处理可接受的新连接事件。
       while (iter.hasNext && shouldRun.get()) {
         try {
           val key = iter.next
+          // 移除已处理 key，避免下轮重复处理。
           iter.remove()
 
           if (key.isAcceptable) {
+            // accept 新连接，成功后交给 Processor 处理后续网络 IO。
             accept(key).foreach { socketChannel =>
-              // Assign the channel to the next processor (using round-robin) to which the
-              // channel can be added without blocking. If newConnections queue is full on
-              // all processors, block until the last one is able to accept a connection.
+              // 按轮询选择可接收连接的 Processor，全部队列满时最后一次允许阻塞等待。
               var retriesLeft = synchronized(processors.length)
               var processor: Processor = null
               do {
                 retriesLeft -= 1
                 processor = synchronized {
-                  // adjust the index (if necessary) and retrieve the processor atomically for
-                  // correct behaviour in case the number of processors is reduced dynamically
+                  // 动态调整网络线程数时，修正下标并原子获取 Processor。
                   currentProcessorIndex = currentProcessorIndex % processors.length
                   processors(currentProcessorIndex)
                 }
                 currentProcessorIndex += 1
+                // 把 Acceptor 接收到的新连接交给某个 Processor 处理。
               } while (!assignNewConnection(socketChannel, processor, retriesLeft == 0))
             }
           } else
+            // Acceptor 只关注 accept 事件，其他事件属于异常状态。
             throw new IllegalStateException("Unrecognized key state for acceptor thread.")
         } catch {
+          // 单个连接接受失败只记录错误，继续处理其他连接。
           case e: Throwable => error("Error while accepting connection", e)
         }
       }
@@ -892,28 +891,30 @@ private[kafka] class Processor(
 
   override def run(): Unit = {
     try {
+      // Processor 主循环持续处理已分配连接上的网络 IO。
       while (shouldRun.get()) {
         try {
-          // setup any new connections that have been queued up
+          // 注册 Acceptor 分配过来的新连接。
           configureNewConnections()
-          // register any new responses for writing
+          // 处理 KafkaRequestHandler 写回的响应，注册写事件或关闭连接。
           processNewResponses()
+          // 轮询 selector，读取请求、写出响应并推进连接状态。
           poll()
+          // 解析已读完整请求，封装成 Request 后放入 RequestChannel。
           processCompletedReceives()
+          // 处理已发送完成的响应，更新指标并恢复连接读取。
           processCompletedSends()
+          // 清理 selector 检测到的断开连接。
           processDisconnected()
+          // 关闭超过连接配额的连接。
           closeExcessConnections()
         } catch {
-          // We catch all the throwables here to prevent the processor thread from exiting. We do this because
-          // letting a processor exit might cause a bigger impact on the broker. This behavior might need to be
-          // reviewed if we see an exception that needs the entire broker to stop. Usually the exceptions thrown would
-          // be either associated with a specific socket channel or a bad request. These exceptions are caught and
-          // processed by the individual methods above which close the failing channel and continue processing other
-          // channels. So this catch block should only ever see ControlThrowables.
+          // 捕获异常防止 Processor 线程退出，避免单连接问题扩大成 broker 网络线程不可用。
           case e: Throwable => processException("Processor got uncaught exception.", e)
         }
       }
     } finally {
+      // 线程退出时关闭 selector 和该 Processor 管理的连接资源。
       debug(s"Closing selector - processor $id")
       Utils.swallow(this.logger.underlying, Level.ERROR, () => closeAll())
     }

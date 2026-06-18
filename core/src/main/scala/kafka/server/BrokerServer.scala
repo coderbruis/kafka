@@ -205,8 +205,10 @@ class BrokerServer(
       // 没有它，broker 后面就拿不到集群元数据，也无法完成 registration / catch-up / unfence。
       sharedServer.startForBroker()
 
+      // 记录 broker 开始启动，便于启动日志定位。
       info("Starting broker")
 
+      // 创建客户端遥测导出插件，供动态配置和 ClientMetricsManager 使用。
       val clientTelemetryExporterPlugin = new ClientTelemetryExporterPlugin()
 
       // 初始化动态配置，clientTelemetry是用于客户端指标观测，不直接参与 Produce/Fetch 的核心读写逻辑。
@@ -272,10 +274,14 @@ class BrokerServer(
         s"broker-${config.nodeId}-",
         60000
       )
+      // 启动 broker 到 controller 的网络通道。
       clientToControllerChannelManager.start()
+      // 封装转发到 controller 的能力，供 KafkaApis 处理控制类请求。
       forwardingManager = new ForwardingManagerImpl(clientToControllerChannelManager, metrics)
+      // 管理客户端遥测指标和连接级指标状态。
       clientMetricsManager = new ClientMetricsManager(clientTelemetryExporterPlugin, config.clientTelemetryMaxBytes, time, metrics)
 
+      // 管理 broker listener 支持的 API 版本和 feature 信息。
       val apiVersionManager = new DefaultApiVersionManager(
         ListenerType.BROKER,
         () => forwardingManager.controllerApiVersions,
@@ -285,10 +291,12 @@ class BrokerServer(
         Optional.of(clientMetricsManager)
       )
 
+      // 缓存 share fetch 会话，减少 share group fetch 请求开销。
       val shareFetchSessionCache : ShareSessionCache = new ShareSessionCache(
         config.shareGroupConfig.shareGroupMaxShareSessions()
       )
 
+      // 注册连接断开回调，用于清理客户端指标和 share fetch 会话。
       val connectionDisconnectListeners = Seq(
         clientMetricsManager.connectionDisconnectListener(),
         shareFetchSessionCache.connectionDisconnectListener()
@@ -297,6 +305,7 @@ class BrokerServer(
       // Create and start the socket server acceptor threads so that the bound port is known.
       // Delay starting processors until the end of the initialization sequence to ensure
       // that credentials have been loaded before processing authentications.
+      // 创建网络入口。此时准备 acceptor 和端口，真正处理请求会延后开启。
       socketServer = new SocketServer(config,
         metrics,
         time,
@@ -305,15 +314,19 @@ class BrokerServer(
         sharedServer.socketFactory,
         connectionDisconnectListeners)
 
+      // 连接 quota 元数据管理器和 SocketServer 的连接 quota。
       clientQuotaMetadataManager = new ClientQuotaMetadataManager(quotaManagers, socketServer.connectionQuotas)
 
+      // 构造 broker 对外注册的 listener 信息，并修正通配地址和临时端口。
       val listenerInfo = ListenerInfo.create(Optional.of(config.interBrokerListenerName.value()),
           config.effectiveAdvertisedBrokerListeners.asJava).
             withWildcardHostnamesResolved().
             withEphemeralPortsCorrected(name => socketServer.boundPort(new ListenerName(name)))
 
+      // 如果启用 tiered storage，创建 remote log manager。
       remoteLogManagerOpt = createRemoteLogManager(listenerInfo)
 
+      // 创建 AlterPartitionManager，用于向 controller 提交分区状态变更。
       alterPartitionManager = DefaultAlterPartitionManager.create(
         config,
         kafkaScheduler,
@@ -323,10 +336,13 @@ class BrokerServer(
         s"broker-${config.nodeId}-",
         () => lifecycleManager.brokerEpoch
       )
+      // 启动分区状态变更管理器。
       alterPartitionManager.start()
 
+      // 创建事务 AddPartitionsToTxn 组件使用的日志上下文和网络客户端。
       val addPartitionsLogContext = new LogContext(s"[AddPartitionsToTxnManager broker=${config.brokerId}]")
       val addPartitionsToTxnNetworkClient = NetworkUtils.buildNetworkClient("AddPartitionsManager", config, metrics, time, addPartitionsLogContext)
+      // 管理事务中新增分区的 controller 交互。
       val addPartitionsToTxnManager = new AddPartitionsToTxnManager(
         config,
         addPartitionsToTxnNetworkClient,
@@ -337,6 +353,7 @@ class BrokerServer(
         time
       )
 
+      // 创建目录分配到 controller 的通信通道。
       val assignmentsChannelManager = new NodeToControllerChannelManagerImpl(
         controllerNodeProvider,
         time,
@@ -346,6 +363,7 @@ class BrokerServer(
         s"broker-${config.nodeId}-",
         60000
       )
+      // 管理 KRaft/JBOD 下 partition 到 log directory 的分配。
       assignmentsManager = new AssignmentsManager(
         time,
         assignmentsChannelManager,
@@ -354,6 +372,7 @@ class BrokerServer(
         (directoryId: Uuid) => logManager.directoryPath(directoryId).
           orElse("[unknown directory path]")
       )
+      // 把目录分配、失败、cordon 事件转交给对应生命周期组件。
       val directoryEventHandler = new DirectoryEventHandler {
         override def handleAssignment(partition: TopicIdPartition, directoryId: Uuid, reason: String, callback: Runnable): Unit =
           assignmentsManager.onAssignment(partition, directoryId, reason, callback)
@@ -368,8 +387,10 @@ class BrokerServer(
       /**
        * TODO: move this action queue to handle thread so we can simplify concurrency handling
        */
+      // ReplicaManager 使用的默认延迟动作队列。
       val defaultActionQueue = new DelayedActionQueue
 
+      // 创建 ReplicaManager，负责副本、分区状态、Produce/Fetch 落盘等数据面核心逻辑。
       this._replicaManager = new ReplicaManager(
         config = config,
         metrics = metrics,
@@ -390,33 +411,43 @@ class BrokerServer(
       )
 
       /* start token manager */
+      // 启动 delegation token 管理能力。
       tokenManager = new DelegationTokenManager(new DelegationTokenManagerConfigs(config), tokenCache)
 
       // Create and initialize an authorizer if one is configured.
       authorizerPlugin = config.createNewAuthorizer(metrics, ProcessRole.BrokerRole.toString)
 
       /* initializing the groupConfigManager */
+      // 管理 group/share group 的动态配置视图。
       groupConfigManager = new GroupConfigManager(config.groupCoordinatorConfig, config.shareGroupConfig)
 
       /* create share coordinator */
+      // 创建 share group coordinator。
       shareCoordinator = createShareCoordinator()
 
       /* create shared timer for share group components */
+      // 创建 share group 组件共享的定时器。
       shareGroupTimer = new SystemTimerReaper("share-group-reaper", new SystemTimer("share-group"))
 
       /* create persister */
+      // 创建 share group 状态持久化组件。
       persister = createShareStatePersister()
 
       /* create metrics object to be shared with share DLQ manager share partition manager*/
+      // 创建 share group 指标对象。
       shareGroupMetrics = new ShareGroupMetrics(time)
 
       /* create share group DLQ manager */
+      // 创建 share group DLQ 管理器。
       shareGroupDLQManager = createShareGroupDLQManager()
 
+      // 创建分区元数据客户端，供 group/share 等组件查询分区信息。
       partitionMetadataClient = createPartitionMetadataClient(metadataCache)
 
+      // 创建 group coordinator，负责 consumer group 协调。
       groupCoordinator = createGroupCoordinator()
 
+      // 创建 producer id 管理器供应器，通过 controller 分配 producer id。
       val producerIdManagerSupplier = () => ProducerIdManager.rpc(
         config.brokerId,
         time,
@@ -426,10 +457,13 @@ class BrokerServer(
 
       // Create transaction coordinator, but don't start it until we've started replica manager.
       // Hardcode Time.SYSTEM for now as some Streams tests fail otherwise, it would be good to fix the underlying issue
+      // 创建事务协调器，让当前 broker 具备处理事务 producer 请求和维护事务状态的能力。
+      // 管理transactional.id，分配、维护 producerId和producer epoch，维护事务状态机
       transactionCoordinator = TransactionCoordinator(config, replicaManager,
         new KafkaScheduler(1, true, "transaction-log-manager-"),
         producerIdManagerSupplier, metrics, metadataCache, Time.SYSTEM)
 
+      // 创建自动建 topic 管理器，封装 group/txn/share 内部 topic 配置。
       autoTopicCreationManager = new DefaultAutoTopicCreationManager(
         config,
         () => groupCoordinator.groupMetadataTopicConfigs,
@@ -439,14 +473,17 @@ class BrokerServer(
         time,
       )
 
+      // 注册各类动态配置变更处理器。
       dynamicConfigHandlers = Map[ConfigType, ConfigHandler](
         ConfigType.TOPIC -> new TopicConfigHandler(replicaManager, config, quotaManagers),
         ConfigType.BROKER -> new BrokerConfigHandler(config, quotaManagers),
         ConfigType.CLIENT_METRICS -> new ClientMetricsConfigHandler(clientMetricsManager),
         ConfigType.GROUP -> new GroupConfigHandler(groupCoordinator))
 
+      // 将 broker 支持的 feature 转成注册到 controller 的格式。
       val featuresRemapped = BrokerFeatures.createDefaultFeatureMap(brokerFeatures)
 
+      // 创建 broker 心跳通道，用于生命周期管理器和 controller 通信。
       val brokerLifecycleChannelManager = new NodeToControllerChannelManagerImpl(
         controllerNodeProvider,
         time,
@@ -456,6 +493,7 @@ class BrokerServer(
         s"broker-${config.nodeId}-",
         config.brokerHeartbeatIntervalMs
       )
+      // 启动 broker 注册/心跳/catch-up 生命周期流程。
       lifecycleManager.start(
         () => sharedServer.loader.lastAppliedOffset(),
         brokerLifecycleChannelManager,
@@ -467,8 +505,11 @@ class BrokerServer(
 
       // The FetchSessionCache is divided into config.numIoThreads shards, each responsible
       // for Math.max(1, shardNum * sessionIdRange) <= sessionId < (shardNum + 1) * sessionIdRange
+      // 为 incremental fetch session 切分 session id 范围。
       val sessionIdRange = Int.MaxValue / NumFetchSessionCacheShards
+      // 创建 fetch session cache 分片集合。
       val fetchSessionCacheShards: util.List[FetchSessionCacheShard] = new util.ArrayList()
+      // 初始化每个 fetch session cache 分片。
       for (shardNum <- 0 until NumFetchSessionCacheShards) {
         fetchSessionCacheShards.add(new FetchSessionCacheShard(
           config.maxIncrementalFetchSessionCacheSlots / NumFetchSessionCacheShards,
@@ -477,8 +518,10 @@ class BrokerServer(
           shardNum
         ))
       }
+      // 创建 FetchManager，管理 fetch session 缓存。
       val fetchManager = new FetchManager(Time.SYSTEM, new FetchSessionCache(fetchSessionCacheShards))
 
+      // 创建 share partition manager，负责 share group 分区读取、锁和状态管理。
       sharePartitionManager = new SharePartitionManager(
         replicaManager,
         new ReplicaManagerLogReader(replicaManager),
@@ -498,6 +541,7 @@ class BrokerServer(
         shareGroupDLQManager
       )
 
+      // 创建 KafkaApis，作为 broker 数据面请求的核心分发处理器。
       dataPlaneRequestProcessor = new KafkaApis(
         requestChannel = socketServer.dataPlaneRequestChannel,
         forwardingManager = forwardingManager,
@@ -523,6 +567,7 @@ class BrokerServer(
         clientMetricsManager = clientMetricsManager,
         groupConfigManager = groupConfigManager)
 
+      // 创建请求处理线程池，从 RequestChannel 拉取请求并调用 KafkaApis。
       dataPlaneRequestHandlerPool = sharedServer.requestHandlerPoolFactory.createPool(
         config.nodeId,
         socketServer.dataPlaneRequestChannel,
@@ -532,10 +577,12 @@ class BrokerServer(
         "broker"
       )
 
+      // 添加 metadata version 校验器，防止不兼容配置被发布。
       metadataPublishers.add(new MetadataVersionConfigValidator(config.brokerId,
         () => config.processRoles.contains(ProcessRole.BrokerRole) && config.logDirs().size() > 1,
         sharedServer.metadataPublishingFaultHandler
       ))
+      // 创建 broker metadata publisher，把 KRaft 元数据发布到 broker 本地组件。
       brokerMetadataPublisher = new BrokerMetadataPublisher(config,
         metadataCache,
         logManager,
@@ -587,9 +634,12 @@ class BrokerServer(
       lifecycleManager.initialCatchUpFuture.whenComplete((_, e) => {
         if (e != null) brokerMetadataPublisher.firstPublishFuture.completeExceptionally(e)
       })
+      // 安装 broker metadata publisher。
       metadataPublishers.add(brokerMetadataPublisher)
+      // 跟踪 broker registration 变化，必要时触发重新注册。
       brokerRegistrationTracker = new BrokerRegistrationTracker(config.brokerId,
         () => lifecycleManager.resendBrokerRegistration())
+      // 安装 broker registration tracker。
       metadataPublishers.add(brokerRegistrationTracker)
 
 
@@ -642,7 +692,9 @@ class BrokerServer(
             listenerInfo.firstListener(),
             config.earlyStartListeners.map(_.value()).asJava))
       }
+      // 提取每个 endpoint 的授权器 ready future。
       val authorizerFutures = endpointReadyFutures.futures().asScala.toMap
+      // 在授权器 ready 后开启 SocketServer 请求处理。
       val enableRequestProcessingFuture = socketServer.enableRequestProcessing(authorizerFutures)
 
       // Block here until all the authorizer futures are complete.
@@ -655,6 +707,7 @@ class BrokerServer(
         "all of the SocketServer Acceptors to be started",
         enableRequestProcessingFuture, startupDeadline, time)
 
+      // 通知 remote log metadata manager：broker 已经完成启动。
       remoteLogManagerOpt.foreach(rlm =>
         rlm.remoteLogMetadataManager() match {
           case callback: BrokerReadyCallback =>
@@ -668,12 +721,15 @@ class BrokerServer(
         }
       )
 
+      // broker 启动完成，切换为 STARTED。
       maybeChangeStatus(STARTING, STARTED)
     } catch {
       case e: Throwable =>
+        // 启动失败时先切到 STARTED，便于复用 shutdown 状态机清理已启动组件。
         maybeChangeStatus(STARTING, STARTED)
         fatal("Fatal error during broker startup. Prepare to shutdown", e)
         shutdown()
+        // 透传真实异常原因，便于上层看到启动失败根因。
         throw if (e.isInstanceOf[ExecutionException]) e.getCause else e
     }
   }

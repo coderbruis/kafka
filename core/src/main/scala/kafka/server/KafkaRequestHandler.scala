@@ -106,35 +106,36 @@ class KafkaRequestHandler(
   @volatile private var stopped = false
 
   def run(): Unit = {
+    // 绑定当前请求线程使用的 RequestChannel，供异步 callback 回到请求线程执行。
     threadRequestChannel.set(requestChannel)
+    // 请求处理线程主循环，持续从 RequestChannel 拉取请求。
     while (!stopped) {
-      // We use a single meter for aggregate idle percentage for the thread pool.
-      // Since meter is calculated as total_recorded_value / time_window and
-      // time_window is independent of the number of threads, each recorded idle
-      // time should be discounted by # threads.
+      // 记录等待请求前的时间，用于计算请求处理线程空闲率。
       val startSelectTime = time.nanoseconds
 
+      // 从 RequestChannel 拉取下一个请求，最多等待 300ms。
       val req = requestChannel.receiveRequest(300)
       val endTime = time.nanoseconds
+      // 计算本次等待请求的空闲时间。
       val idleTime = endTime - startSelectTime
-      // Per-pool idle ratio uses the pool's own thread count as denominator
+      // 记录当前 handler pool 的空闲率。
       poolIdleMeter.mark(idleTime / poolHandlerThreads.get)
-      // Aggregate idle ratio uses the total threads across all pools as denominator
+      // 记录所有 request handler pool 聚合后的空闲率。
       aggregateIdleMeter.mark(idleTime / aggregateThreads.get)
 
       req match {
         case _: ShutdownRequest =>
+          // 收到关闭请求时完成线程清理并退出循环。
           debug(s"Kafka request handler $id on broker $brokerId received shut down command")
           completeShutdown()
           return
 
         case callback: CallbackRequest =>
+          // 处理异步操作完成后重新调度到请求线程的 callback。
           val originalRequest = callback.originalRequest
           try {
 
-            // If we've already executed a callback for this request, reset the times and subtract the callback time from the
-            // new dequeue time. This will allow calculation of multiple callback times.
-            // Otherwise, set dequeue time to now.
+            // 更新 callback 出队时间，支持同一请求多次 callback 的耗时统计。
             if (originalRequest.callbackRequestDequeueTimeNanos.isPresent) {
               val prevCallbacksTimeNanos = originalRequest.callbackRequestCompleteTimeNanos.orElse(0L) -
                 originalRequest.callbackRequestDequeueTimeNanos.orElse(0L)
@@ -144,44 +145,57 @@ class KafkaRequestHandler(
               originalRequest.callbackRequestDequeueTimeNanos(OptionalLong.of(time.nanoseconds()))
             }
 
+            // 标记当前线程正在处理的原始请求，供 callback 逻辑获取上下文。
             threadCurrentRequest.set(originalRequest)
+            // 执行被重新调度到请求线程的 callback。
             callback.fun().accept(requestLocal)
           } catch {
             case e: FatalExitError =>
+              // 致命退出异常直接完成清理并退出进程。
               completeShutdown()
               Exit.exit(e.statusCode)
             case e: Throwable => error("Exception when handling request", e)
           } finally {
-            // When handling requests, we try to complete actions after, so we should try to do so here as well.
+            // callback 执行后尝试推进延迟动作。
             apis.tryCompleteActions()
+            // 记录 callback 完成时间，避免响应指标缺失。
             if (originalRequest.callbackRequestCompleteTimeNanos.isEmpty)
               originalRequest.callbackRequestCompleteTimeNanos(OptionalLong.of(time.nanoseconds()))
+            // 清理当前线程请求上下文。
             threadCurrentRequest.remove()
           }
 
         case request: Request =>
+          // 处理普通 Kafka 请求，进入 KafkaApis 业务分发。
           try {
+            // 记录请求从 RequestChannel 出队时间。
             request.requestDequeueTimeNanos(endTime)
             trace(s"Kafka request handler $id on broker $brokerId handling request $request")
+            // 标记当前线程正在处理的请求。
             threadCurrentRequest.set(request)
+            // 调用 KafkaApis，根据 ApiKey 分发到对应业务逻辑。
             apis.handle(request, requestLocal)
           } catch {
             case e: FatalExitError =>
+              // 致命退出异常直接完成清理并退出进程。
               completeShutdown()
               Exit.exit(e.statusCode)
             case e: Throwable => error("Exception when handling request", e)
           } finally {
+            // 清理当前线程请求上下文。
             threadCurrentRequest.remove()
+            // 释放请求持有的网络 buffer。
             request.releaseBuffer()
           }
 
         case _: WakeupRequest =>
-          // We should handle this in receiveRequest by polling callbackQueue.
+          // WakeupRequest 通常应在 receiveRequest 内部消费，这里只记录异常路径。
           warn("Received a wakeup request outside of typical usage.")
 
-        case null => // continue
+        case null => // 本轮没有请求，继续下一次轮询。
       }
     }
+    // stopped 后完成请求线程清理。
     completeShutdown()
   }
 
