@@ -72,7 +72,11 @@ object Kafka extends Logging {
 
   def main(args: Array[String]): Unit = {
     try {
+      // 解析命令行参数，读取server.properties，
+      // bin/kafka-server-start.sh config/kraft/server.properties \
+      //  --override log.dirs=/tmp/kraft-combined-logs
       val serverProps = getPropsFromArgs(args)
+      // 构建server实例，主要是场景KafkaRaftServer实例
       val server = buildServer(serverProps)
 
       try {
@@ -95,6 +99,7 @@ object Kafka extends Logging {
         }
       })
 
+      // 启动KafkaRaftServer
       try server.startup()
       catch {
         case e: Throwable =>
@@ -103,6 +108,7 @@ object Kafka extends Logging {
           Exit.exit(1)
       }
 
+      // 阻塞等待关闭，让 main 线程等待服务结束。
       server.awaitShutdown()
     }
     catch {

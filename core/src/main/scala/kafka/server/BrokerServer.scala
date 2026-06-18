@@ -196,32 +196,42 @@ class BrokerServer(
   def replicaManager: ReplicaManager = _replicaManager
 
   override def startup(): Unit = {
+    // 启动状态保护和超时控制。防止重复启动。
     if (!maybeChangeStatus(SHUTDOWN, STARTING)) return
     val startupDeadline = Deadline.fromDelay(time, config.serverMaxStartupTimeMs, TimeUnit.MILLISECONDS)
     try {
+      // 启动 broker/controller 共享的 KRaft 基础设施。
+      // 为了先把 KRaft metadata log 读取、metadata loader、snapshot 机制 这些公共底座启动起来。
+      // 没有它，broker 后面就拿不到集群元数据，也无法完成 registration / catch-up / unfence。
       sharedServer.startForBroker()
 
       info("Starting broker")
 
       val clientTelemetryExporterPlugin = new ClientTelemetryExporterPlugin()
 
+      // 初始化动态配置，clientTelemetry是用于客户端指标观测，不直接参与 Produce/Fetch 的核心读写逻辑。
       config.dynamicConfig.initialize(Some(clientTelemetryExporterPlugin))
+      // 实例化quota，quota 是 broker 的资源保护机制，用来限制客户端、用户或操作类型的资源使用，防止单个调用方或某类请求拖垮 broker。
       quotaManagers = QuotaFactory.instantiate(config, metrics, time, s"broker-${config.nodeId}-", ProcessRole.BrokerRole.toString)
+      // 并从 metadata snapshot 读取动态 broker 配置
       DynamicBrokerConfig.readDynamicBrokerConfigsFromSnapshot(raftManager, config, quotaManagers, logContext)
 
       /* start scheduler */
       kafkaScheduler = new KafkaScheduler(config.backgroundThreads)
+      // 启动后台调度器，这个是broker 的通用后台任务线程池，后面 LogManager、ReplicaManager 等组件创建后，就可以往里面注册周期任务。
       kafkaScheduler.startup()
 
       /* register broker metrics */
+      // Kafka broker 上 topic 级别 + broker 汇总级别的吞吐、请求、失败、复制、remote storage 指标统计器
       brokerTopicStats = new BrokerTopicStats(config.remoteLogManagerConfig.isRemoteStorageSystemEnabled())
-
+      // 日志目录故障通知通道。并不是恢复组件，只是“发现日志目录坏了之后，用来统一上报和排队通知”的通道
       logDirFailureChannel = new LogDirFailureChannel(config.logDirs.size)
-
+      // metadataCache 是 broker 本地保存的 KRaft 集群元数据快照，供 broker 各组件快速判断 topic、partition、broker、leader、配置和 feature 状态。
       metadataCache = new KRaftMetadataCache(config.nodeId, () => raftManager.client.kraftVersion())
 
       // Create log manager, but don't start it because we need to delay any potential unclean shutdown log recovery
       // until we catch up on the metadata log and have up-to-date topic and broker configs.
+      // 负责本地日志目录、分区日志、恢复、flush、retention 等。但这里先创建，不急着完整恢复，因为要等 metadata catch-up 后才知道最新 topic/broker 配置。
       logManager = LogManager(config,
         sharedServer.metaPropsEnsemble.errorLogDirs(),
         metadataCache,
@@ -229,7 +239,7 @@ class BrokerServer(
         time,
         brokerTopicStats,
         logDirFailureChannel)
-
+      // 负责 broker 注册、心跳、broker epoch、等待 controller 确认 catch-up、unfence 等生命周期。
       lifecycleManager = new BrokerLifecycleManager(
         config,
         time,
@@ -240,15 +250,19 @@ class BrokerServer(
 
       // Enable delegation token cache for all SCRAM mechanisms to simplify dynamic update.
       // This keeps the cache up-to-date if new SCRAM mechanisms are enabled dynamically.
+      // 给认证、SCRAM、delegation token 动态更新使用。
       tokenCache = new DelegationTokenCache(ScramMechanism.mechanismNames)
       credentialProvider = new CredentialProvider(ScramMechanism.mechanismNames, tokenCache)
 
+      // 等待 sharedServer.controllerQuorumVotersFuture 完成。
+      // waitWithLogging 的作用是等待 future，同时带日志，方便定位卡在哪一步。
       FutureUtils.waitWithLogging(logger.underlying, logIdent,
         "controller quorum voters future",
         sharedServer.controllerQuorumVotersFuture,
         startupDeadline, time)
+      // 创建一个 controllerNodeProvider。它负责告诉 broker：当前应该连接哪个 controller 节点。
       val controllerNodeProvider = RaftControllerNodeProvider.create(raftManager, config)
-
+      // 用来转发需要 controller 处理的请求；forwardingManager 是 Kafka API 层使用的封装。
       clientToControllerChannelManager = new NodeToControllerChannelManagerImpl(
         controllerNodeProvider,
         time,

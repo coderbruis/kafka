@@ -136,6 +136,7 @@ public class ProducerMetadata extends Metadata {
     }
 
     /**
+     * 它就是 Producer 发送消息前，如果发现 metadata 不够用，就阻塞当前发送线程，等 Sender 线程把 metadata 刷新回来。
      * Wait for metadata update until the current version is larger than the last version we know of
      */
     public synchronized void awaitUpdate(final int lastVersion, final long timeoutMs) throws InterruptedException {
