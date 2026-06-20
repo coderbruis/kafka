@@ -394,8 +394,10 @@ class KafkaApis(val requestChannel: RequestChannel,
    * Handle a produce request
    */
   def handleProduceRequest(request: Request, requestLocal: RequestLocal): Unit = {
+    // 解析 Produce 请求体，后续校验和写入都基于该协议对象。
     val produceRequest = request.body(classOf[ProduceRequest])
 
+    // 事务消息必须先校验 transactionalId 写权限，避免未授权写入进入副本追加流程。
     if (RequestUtils.hasTransactionalRecords(produceRequest)) {
       val isAuthorizedTransactional = produceRequest.transactionalId != null &&
         authHelper.authorize(request.context, WRITE, TRANSACTIONAL_ID, produceRequest.transactionalId)
@@ -411,29 +413,32 @@ class KafkaApis(val requestChannel: RequestChannel,
     val authorizedRequestInfo = mutable.Map[TopicIdPartition, MemoryRecords]()
     val topicIdToPartitionData = new mutable.ArrayBuffer[(TopicIdPartition, ProduceRequestData.PartitionProduceData)]
 
+    // 先把请求中的 topicId/topicName 统一解析成 TopicIdPartition。
     produceRequest.data.topicData.forEach { topic =>
       topic.partitionData.forEach { partition =>
+        // 定义的元祖（topicName, topicId）
         val (topicName, topicId) = if (topic.topicId().equals(Uuid.ZERO_UUID)) {
+          // 返回的元祖
           (topic.name(), metadataCache.getTopicId(topic.name()))
         } else {
+          // 返回的元祖
           (metadataCache.getTopicName(topic.topicId).orElse(topic.name), topic.topicId())
         }
 
         val topicPartition = new TopicPartition(topicName, partition.index())
-        // To be compatible with the old version, only return UNKNOWN_TOPIC_ID if request version uses topicId, but the corresponding topic name can't be found.
+        // 兼容旧版本协议，只有使用 topicId 的新版本请求才返回 UNKNOWN_TOPIC_ID。
         if (topicName.isEmpty && request.header.apiVersion > 12)
           nonExistingTopicResponses += new TopicIdPartition(topicId, topicPartition) -> new PartitionResponse(Errors.UNKNOWN_TOPIC_ID)
         else
           topicIdToPartitionData += new TopicIdPartition(topicId, topicPartition) -> partition
       }
     }
-    // cache the result to avoid redundant authorization calls
+    // 按 topic 批量做授权过滤，避免每个分区重复调用授权器。
     val authorizedTopics = authHelper.filterByAuthorized(request.context, WRITE, TOPIC, topicIdToPartitionData)(_._1.topic)
 
+    // 对每个分区做权限、元数据和 record 格式校验，只有合法数据才进入追加流程。
     topicIdToPartitionData.foreach { case (topicIdPartition, partition) =>
-      // This caller assumes the type is MemoryRecords and that is true on current serialization
-      // We cast the type to avoid causing big change to code base.
-      // https://issues.apache.org/jira/browse/KAFKA-10698
+      // 当前序列化路径保证 records 是 MemoryRecords，这里只做最小类型转换。
       val memoryRecords = partition.records.asInstanceOf[MemoryRecords]
       if (!authorizedTopics.contains(topicIdPartition.topic))
         unauthorizedTopicResponses += topicIdPartition -> new PartitionResponse(Errors.TOPIC_AUTHORIZATION_FAILED)
@@ -449,15 +454,13 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
     }
 
-    // the callback for sending a produce response
-    // The construction of ProduceResponse is able to accept auto-generated protocol data so
-    // KafkaApis#handleProduceRequest should apply auto-generated protocol to avoid extra conversion.
-    // https://issues.apache.org/jira/browse/KAFKA-10730
+    // 构造并发送 Produce 响应，统一合并追加结果和前置校验失败结果。
     @nowarn("cat=deprecation")
     def sendResponseCallback(responseStatus: Map[TopicIdPartition, PartitionResponse]): Unit = {
       val mergedResponseStatus = responseStatus ++ unauthorizedTopicResponses ++ nonExistingTopicResponses ++ invalidRequestResponses
       var errorInResponse = false
 
+      // 记录分区错误，并在新版本响应中补充当前 leader 信息，帮助客户端刷新元数据。
       val nodeEndpoints = new mutable.HashMap[Int, Node]
       mergedResponseStatus.foreachEntry { (topicIdPartition, status) =>
         if (status.error != Errors.NONE) {
@@ -484,9 +487,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
       }
 
-      // Record both bandwidth and request quota-specific values and throttle by muting the channel if any of the quotas
-      // have been violated. If both quotas have been violated, use the max throttle time between the two quotas. Note
-      // that the request quota is not enforced if acks == 0.
+      // 统计 produce 带宽和请求配额，取最大限流时间对连接做节流。
       val timeMs = time.milliseconds()
       val requestSize = request.sizeInBytes
       val bandwidthThrottleTimeMs = quotas.produce.maybeRecordAndGetThrottleTimeMs(request.session, request.header.clientId(), requestSize, timeMs)
@@ -503,11 +504,9 @@ class KafkaApis(val requestChannel: RequestChannel,
         }
       }
 
-      // Send the response immediately. In case of throttling, the channel has already been muted.
+      // 根据 acks 语义发送响应；被限流时前面已经静默连接。
       if (produceRequest.acks == 0) {
-        // no operation needed if producer request.required.acks = 0; however, if there is any error in handling
-        // the request, since no response is expected by the producer, the server will close socket server so that
-        // the producer client will know that some error has happened and will refresh its metadata
+        // acks=0 正常不回包；若处理出错则关闭连接，让客户端感知异常并刷新元数据。
         if (errorInResponse) {
           val exceptionsSummary = mergedResponseStatus.map { case (topicPartition, status) =>
             topicPartition -> status.error.exceptionName
@@ -519,8 +518,7 @@ class KafkaApis(val requestChannel: RequestChannel,
           )
           requestChannel.closeConnection(request, new ProduceResponse(mergedResponseStatus.asJava).errorCounts)
         } else {
-          // Note that although request throttling is exempt for acks == 0, the channel may be throttled due to
-          // bandwidth quota violation.
+          // acks=0 不受请求配额限流，但仍可能因带宽配额被限流。
           requestHelper.sendNoOpResponseExemptThrottle(request)
         }
       } else {
@@ -528,18 +526,20 @@ class KafkaApis(val requestChannel: RequestChannel,
       }
     }
 
+    // 回写 record 转换统计，用于观测压缩、格式转换等处理开销。
     def processingStatsCallback(processingStats: ProduceResponseStats): Unit = {
       processingStats.foreachEntry { (topicIdPartition, info) =>
         updateRecordConversionStats(request, topicIdPartition.topicPartition(), info)
       }
     }
 
+    // 没有可写入分区时直接返回前置校验结果。
     if (authorizedRequestInfo.isEmpty)
       sendResponseCallback(Map.empty)
     else {
       val internalTopicsAllowed = request.header.clientId == "__admin_client"
       val transactionSupportedOperation = AddPartitionsToTxnManager.produceRequestVersionToTransactionSupportedOperation(request.header.apiVersion())
-      // call the replica manager to append messages to the replicas
+      // 交给 ReplicaManager 追加日志，并按 acks/min.insync.replicas 等语义完成响应。
       replicaManager.handleProduceAppend(
         timeout = produceRequest.timeout.toLong,
         requiredAcks = produceRequest.acks,
@@ -551,8 +551,7 @@ class KafkaApis(val requestChannel: RequestChannel,
         requestLocal = requestLocal,
         transactionSupportedOperation = transactionSupportedOperation)
 
-      // if the request is put into the purgatory, it will have a held reference and hence cannot be garbage collected;
-      // hence we clear its data here in order to let GC reclaim its memory since it is already appended to log
+      // 追加后清理请求中的 records 引用，避免延迟请求持有大对象影响 GC。
       produceRequest.clearPartitionRecords()
     }
   }

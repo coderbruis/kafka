@@ -1224,30 +1224,35 @@ class Partition(val topicPartition: TopicPartition,
     verificationGuard: VerificationGuard = VerificationGuard.SENTINEL,
     transactionVersion: Short = TransactionVersion.TV_UNKNOWN
   ): LogAppendInfo = {
+    // 核心总结：分区级 leader 写入口，确认本地 leader 和 min ISR 后把 records 写入 leader log。
     val (info, leaderHWIncremented) = inReadLock(leaderIsrUpdateLock, () => {
       leaderLogIfLocal match {
         case Some(leaderLog) =>
           val minIsr = effectiveMinIsr(leaderLog)
           val inSyncSize = partitionState.isr.size
 
-          // Avoid writing to leader if there are not enough insync replicas to make it safe
+          // requiredAcks == -1 表示acks=all
+          // acks=all 时必须满足 min.insync.replicas，否则写入即使成功也无法达到复制安全语义。
           if (inSyncSize < minIsr && requiredAcks == -1) {
             throw new NotEnoughReplicasException(s"The size of the current ISR : $inSyncSize " +
               s"is insufficient to satisfy the min.isr requirement of $minIsr for partition $topicPartition, " +
               s"live replica(s) broker.id are : $inSyncReplicaIds")
           }
 
+          // 进入逻辑日志层，以 leader 身份分配 offset/epoch 并追加到本地日志。
           val info = leaderLog.appendAsLeader(records, this.leaderEpoch, origin, requestLocal, verificationGuard, transactionVersion)
 
-          // we may need to increment high watermark since ISR could be down to 1
+          // ISR 可能只剩 leader 自己，写入后需要尝试推进 high watermark。
           (info, maybeIncrementLeaderHW(leaderLog))
 
         case None =>
+          // 当前 broker 不是该分区 leader，不能接收 Produce 写入。
           throw new NotLeaderOrFollowerException("Leader not local for partition %s on broker %d"
             .format(topicPartition, localBrokerId))
       }
     })
 
+    // 把 high watermark 是否推进带回上层，用于唤醒等待中的请求。
     info.copy(if (leaderHWIncremented) LeaderHwChange.INCREASED else LeaderHwChange.SAME)
   }
 

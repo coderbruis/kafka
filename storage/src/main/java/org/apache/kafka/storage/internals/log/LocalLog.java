@@ -525,6 +525,8 @@ public class LocalLog {
     }
 
     public void append(long lastOffset, MemoryRecords records) throws IOException {
+        // 核心总结：把 records 写入当前 active segment，并推进本地日志末端 offset。
+        // 进入 segment 层后会同时维护 .log 文件和稀疏索引。
         segments.activeSegment().append(lastOffset, records);
         updateLogEndOffset(lastOffset + 1);
     }

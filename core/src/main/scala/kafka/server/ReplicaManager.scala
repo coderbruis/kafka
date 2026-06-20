@@ -593,7 +593,9 @@ class ReplicaManager(val config: KafkaConfig,
     verificationGuards: Map[TopicPartition, VerificationGuard] = Map.empty,
     transactionVersion: Short = TransactionVersion.TV_UNKNOWN
   ): Map[TopicIdPartition, LogAppendResult] = {
+    // 核心总结：把 Produce 数据写入本 broker 上的 leader 副本本地日志，不在这里等待 follower 复制完成。
     val startTimeMs = time.milliseconds
+    // 进入本地日志追加流程，逐分区完成 leader 校验和日志写入。
     val localProduceResultsWithTopicId = appendToLocalLog(
       internalTopicsAllowed = internalTopicsAllowed,
       origin,
@@ -605,6 +607,7 @@ class ReplicaManager(val config: KafkaConfig,
     )
     debug("Produce to local log in %d ms".format(time.milliseconds - startTimeMs))
 
+    // 写入可能推进 LEO/HW，触发等待中的 produce/fetch/delete/share fetch 请求重新检查完成条件。
     addCompletePurgatoryAction(actionQueue, localProduceResultsWithTopicId)
 
     localProduceResultsWithTopicId
@@ -645,11 +648,13 @@ class ReplicaManager(val config: KafkaConfig,
                     requestLocal: RequestLocal = RequestLocal.noCaching,
                     verificationGuards: Map[TopicPartition, VerificationGuard] = Map.empty,
                     transactionVersion: Short = TransactionVersion.TV_UNKNOWN): Unit = {
+    // 核心总结：控制 Produce 追加的整体响应语义，先写 leader 本地日志，再按 acks 决定立即返回或等待复制。
     if (!isValidRequiredAcks(requiredAcks)) {
       sendInvalidRequiredAcksResponse(entriesPerPartition, responseCallback)
       return
     }
 
+    // 先完成 leader 本地追加，得到每个分区的初始写入结果。
     val localProduceResults = appendRecordsToLeader(
       requiredAcks,
       internalTopicsAllowed,
@@ -663,10 +668,12 @@ class ReplicaManager(val config: KafkaConfig,
 
     val produceStatus = buildProducePartitionStatus(localProduceResults)
 
+    // 回传 record 校验/转换统计，用于 Produce 请求的处理指标。
     recordValidationStatsCallback(localProduceResults.map { case (k, v) =>
       k -> v.logAppendSummary().recordValidationStats()
     })
 
+    // 根据 requiredAcks 判断是否需要进入 delayed produce 等待 ISR 副本追上。
     maybeAddDelayedProduce(
       requiredAcks,
       timeout,
@@ -704,11 +711,12 @@ class ReplicaManager(val config: KafkaConfig,
                           requestLocal: RequestLocal = RequestLocal.noCaching,
                           transactionSupportedOperation: TransactionSupportedOperation): Unit = {
 
+    // 核心总结：Produce 追加的外层入口；事务消息先做分区入事务校验，非事务消息直接进入 appendRecords。
     val transactionalProducerInfo = mutable.HashSet[(Long, Short)]()
     val topicPartitionBatchInfo = mutable.Map[TopicPartition, Int]()
     val topicIds = entriesPerPartition.keys.map(tp => tp.topic() -> tp.topicId()).toMap
     entriesPerPartition.foreachEntry { (topicIdPartition, records) =>
-      // Produce requests (only requests that require verification) should only have one batch per partition in "batches" but check all just to be safe.
+      // 提取事务 batch 的 producer 信息，后面用于校验这些分区是否已经加入事务。
       val transactionalBatches = records.batches.asScala.filter(batch => batch.hasProducerId && batch.isTransactional)
       transactionalBatches.foreach(batch => transactionalProducerInfo.add(batch.producerId, batch.producerEpoch))
       if (transactionalBatches.nonEmpty) topicPartitionBatchInfo.put(topicIdPartition.topicPartition(), records.firstBatch.baseSequence)
@@ -722,14 +730,11 @@ class ReplicaManager(val config: KafkaConfig,
       val (preAppendErrors, verificationGuards) = results
       val errorResults: Map[TopicIdPartition, LogAppendResult] = preAppendErrors.map {
         case (topicPartition, error) =>
-          // translate transaction coordinator errors to known producer response errors
+          // 将事务协调器校验错误转换成 Produce 客户端能理解的分区写入错误。
           val customException =
             error match {
               case Errors.INVALID_TXN_STATE => Some(error.exception("Partition was not added to the transaction"))
-              // Transaction verification can fail with a retriable error that older clients may not
-              // retry correctly. Translate these to an error which will cause such clients to retry
-              // the produce request. We pick `NOT_ENOUGH_REPLICAS` because it does not trigger a
-              // metadata refresh.
+              // 兼容旧客户端重试行为，事务校验的临时错误转换为可重试且不触发元数据刷新的错误。
               case Errors.NETWORK_EXCEPTION |
                    Errors.COORDINATOR_LOAD_IN_PROGRESS |
                    Errors.COORDINATOR_NOT_AVAILABLE |
@@ -740,8 +745,7 @@ class ReplicaManager(val config: KafkaConfig,
                   Some(new NotEnoughReplicasException(
                     s"Unable to verify the partition has been added to the transaction. Underlying error: ${error.toString}"))
                 } else {
-                  // Don't convert the Concurrent Transaction exception for TV2. Because the error is very common during
-                  // the transaction commit phase. Returning Concurrent Transaction is less confusing to the client.
+                  // TV2 直接返回并发事务错误，避免在提交阶段把常见状态误报成副本不足。
                   None
                 }
               case _ => None
@@ -752,8 +756,7 @@ class ReplicaManager(val config: KafkaConfig,
             customException.isDefined
           )
       }
-      // In non-transaction paths, errorResults is typically empty, so we can
-      // directly use entriesPerPartition instead of creating a new filtered collection
+      // 非事务路径通常没有前置错误，直接复用原始待写分区集合。
       val entriesWithoutErrorsPerPartition =
         if (errorResults.nonEmpty) entriesPerPartition.filter { case (key, _) => !errorResults.contains(key) }
         else entriesPerPartition
@@ -764,6 +767,7 @@ class ReplicaManager(val config: KafkaConfig,
         responseCallback(preAppendPartitionResponses ++ responses.asScala)
       }
 
+      // 事务校验完成后，才进入真正的 leader 本地追加和 acks 等待流程。
       appendRecords(
         timeout = timeout,
         requiredAcks = requiredAcks,
@@ -785,9 +789,7 @@ class ReplicaManager(val config: KafkaConfig,
       return
     }
 
-    // Wrap the callback to be handled on an arbitrary request handler thread
-    // when transaction verification is complete. The request local passed in
-    // is only used when the callback is executed immediately.
+    // 事务校验是异步完成的，回调需要切回请求处理线程再继续追加。
     val wrappedPostVerificationCallback = KafkaRequestHandler.wrapAsyncCallback(
       postVerificationCallback,
       requestLocal
@@ -1381,6 +1383,7 @@ class ReplicaManager(val config: KafkaConfig,
                                verificationGuards: Map[TopicPartition, VerificationGuard],
                                transactionVersion: Short):
   Map[TopicIdPartition, LogAppendResult] = {
+    // 核心总结：逐分区写入本地 leader 日志，并把每个分区的成功或异常包装成 LogAppendResult。
     val traceEnabled = isTraceEnabled
     def processFailedRecord(topicIdPartition: TopicIdPartition, t: Throwable) = {
       val logStartOffset = onlinePartition(topicIdPartition.topicPartition()).map(_.logStartOffset).getOrElse(-1L)
@@ -1403,7 +1406,7 @@ class ReplicaManager(val config: KafkaConfig,
       brokerTopicStats.topicStats(topicIdPartition.topic).totalProduceRequestRate.mark()
       brokerTopicStats.allTopicsStats.totalProduceRequestRate.mark()
 
-      // reject appending to internal topics if it is not allowed
+      // 普通 Produce 不允许直接写内部 topic，避免破坏 Kafka 内部状态。
       if (Topic.isInternal(topicIdPartition.topic) && !internalTopicsAllowed) {
         (topicIdPartition, new LogAppendResult(
           LogAppendSummary.fromAppendInfo(LogAppendInfo.UNKNOWN_LOG_APPEND_INFO),
@@ -1412,11 +1415,12 @@ class ReplicaManager(val config: KafkaConfig,
       } else {
         try {
           val partition = getPartitionOrException(topicIdPartition)
+          // 进入分区级 leader 写入，继续检查 leader、本地日志和 min ISR。
           val info = partition.appendRecordsToLeader(records, origin, requiredAcks, requestLocal,
             verificationGuards.getOrElse(topicIdPartition.topicPartition(), VerificationGuard.SENTINEL), transactionVersion)
           val numAppendedMessages = info.numMessages
 
-          // update stats for successfully appended bytes and messages as bytesInRate and messageInRate
+          // 写入成功后更新 broker/topic 级吞吐指标。
           brokerTopicStats.topicStats(topicIdPartition.topic).bytesInRate.mark(records.sizeInBytes)
           brokerTopicStats.allTopicsStats.bytesInRate.mark(records.sizeInBytes)
           brokerTopicStats.topicStats(topicIdPartition.topic).messagesInRate.mark(numAppendedMessages)
@@ -1429,8 +1433,7 @@ class ReplicaManager(val config: KafkaConfig,
           (topicIdPartition,  new LogAppendResult(LogAppendSummary.fromAppendInfo(info), Optional.empty(), false))
 
         } catch {
-          // NOTE: Failed produce requests metric is not incremented for known exceptions
-          // it is supposed to indicate un-expected failures of a broker in handling a produce request
+          // 已知业务错误直接作为分区写入结果返回，不计入 broker 意外失败指标。
           case e@ (_: UnknownTopicOrPartitionException |
                    _: NotLeaderOrFollowerException |
                    _: RecordTooLargeException |

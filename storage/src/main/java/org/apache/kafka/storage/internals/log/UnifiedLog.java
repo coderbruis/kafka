@@ -1052,6 +1052,7 @@ public class UnifiedLog implements AutoCloseable {
                                         RequestLocal requestLocal,
                                         VerificationGuard verificationGuard,
                                         short transactionVersion) {
+        // 核心总结：leader写入入口，决定是否由 leader 重新校验并分配 offset，然后进入统一 append 流程。
         boolean validateAndAssignOffsets = origin != AppendOrigin.RAFT_LEADER;
         return append(records, origin, validateAndAssignOffsets, leaderEpoch, Optional.of(requestLocal),
             verificationGuard, false, RecordBatch.CURRENT_MAGIC_VALUE, transactionVersion);
@@ -1121,19 +1122,20 @@ public class UnifiedLog implements AutoCloseable {
                                  boolean ignoreRecordSize,
                                  byte toMagic,
                                  short transactionVersion) {
-        // We want to ensure the partition metadata file is written to the log dir before any log data is written to disk.
-        // This will ensure that any log data can be recovered with the correct topic ID in the case of failure.
+        // 核心总结：完成真正的逻辑日志追加，包括 record 校验、offset 分配、segment 写入、幂等/事务状态更新。
+        // 写数据前先落 topic 元数据，保证故障恢复时能用正确 topicId 识别日志目录。
         maybeFlushMetadataFile();
 
+        // 先做基础格式、大小、时间戳等校验，并收集本次 append 的概要信息。
         LogAppendInfo appendInfo = analyzeAndValidateRecords(records, origin, ignoreRecordSize, !validateAndAssignOffsets, leaderEpoch);
 
-        // return if we have no valid messages or if this is a duplicate of the last appended entry
+        // 没有有效消息时无需写磁盘，直接返回分析结果。
         if (appendInfo.validBytes() <= 0) {
             return appendInfo;
         } else {
-            // trim any invalid bytes or partial messages before appending it to the on-disk log
+            // 去掉无效尾部或半条消息，只把有效 records 写入磁盘日志。
             final MemoryRecords trimmedRecords = trimInvalidBytes(records, appendInfo);
-            // they are valid, insert them in the log
+            // 进入日志写入临界区，串行维护 offset、索引和 producer 状态。
             synchronized (lock)  {
                 return maybeHandleIOException(
                         () -> "Error while appending records to " + topicPartition() + " in dir " + dir().getParent(),
@@ -1141,7 +1143,7 @@ public class UnifiedLog implements AutoCloseable {
                             MemoryRecords validRecords = trimmedRecords;
                             localLog.checkIfMemoryMappedBufferClosed();
                             if (validateAndAssignOffsets) {
-                                // assign offsets to the message set
+                                // leader 追加时从当前 LEO 开始为 batch 分配连续 offset。
                                 PrimitiveRef.LongRef offset = PrimitiveRef.ofLong(localLog.logEndOffset());
                                 appendInfo.setFirstOffset(offset.value);
                                 Compression targetCompression = BrokerCompressionType.targetCompression(config().compression, appendInfo.sourceCompression());
@@ -1171,13 +1173,11 @@ public class UnifiedLog implements AutoCloseable {
                                     appendInfo.setLogAppendTime(validateAndOffsetAssignResult.logAppendTimeMs());
                                 }
 
-                                // re-validate message sizes if there's a possibility that they have changed (due to re-compression or message
-                                // format conversion)
+                                // 重新压缩或格式转换后大小可能变化，需要再次校验单批大小限制。
                                 if (!ignoreRecordSize && validateAndOffsetAssignResult.messageSizeMaybeChanged()) {
                                     validRecords.batches().forEach(batch -> {
                                         if (batch.sizeInBytes() > config().maxMessageSize()) {
-                                            // we record the original message set size instead of the trimmed size
-                                            // to be consistent with pre-compression bytesRejectedRate recording
+                                            // 统计原始请求大小，和压缩前拒绝指标保持一致。
                                             brokerTopicStats.topicStats(topicPartition().topic()).bytesRejectedRate().mark(records.sizeInBytes());
                                             brokerTopicStats.allTopicsStats().bytesRejectedRate().mark(records.sizeInBytes());
                                             throw new RecordTooLargeException("Message batch size is " + batch.sizeInBytes() + " bytes in append to" +
@@ -1186,11 +1186,9 @@ public class UnifiedLog implements AutoCloseable {
                                     });
                                 }
                             } else {
-                                // we are taking the offsets we are given
+                                // follower/复制路径使用 leader 已分配的 offset，不能倒退覆盖本地日志末端。
                                 if (appendInfo.firstOrLastOffsetOfFirstBatch() < localLog.logEndOffset()) {
-                                    // we may still be able to recover if the log is empty
-                                    // one example: fetching from log start offset on the leader which is not batch aligned,
-                                    // which may happen as a result of AdminClient#deleteRecords()
+                                    // 如果远端从非 batch 边界拉取，错误信息里保留前几个 offset 便于定位。
                                     boolean hasFirstOffset = appendInfo.firstOffset() != UnifiedLog.UNKNOWN_OFFSET;
                                     long firstOffset = hasFirstOffset ? appendInfo.firstOffset() : records.batches().iterator().next().baseOffset();
 
@@ -1209,14 +1207,12 @@ public class UnifiedLog implements AutoCloseable {
                                 }
                             }
 
-                            // update the epoch cache with the epoch stamped onto the message by the leader
+                            // 更新 leader epoch 缓存，供截断、选主和副本一致性检查使用。
                             validRecords.batches().forEach(batch -> {
                                 if (batch.magic() >= RecordBatch.MAGIC_VALUE_V2) {
                                     assignEpochStartOffset(batch.partitionLeaderEpoch(), batch.baseOffset());
                                 } else {
-                                    // In partial upgrade scenarios, we may get a temporary regression to the message format. In
-                                    // order to ensure the safety of leader election, we clear the epoch cache so that we revert
-                                    // to truncation by high watermark after the next leader election.
+                                    // 老消息格式没有可靠 leader epoch，清空缓存后退回按 HW 截断。
                                     if (leaderEpochCache.nonEmpty()) {
                                         logger.warn("Clearing leader epoch cache after unexpected append with message format v{}", batch.magic());
                                         leaderEpochCache.clearAndFlush();
@@ -1224,13 +1220,13 @@ public class UnifiedLog implements AutoCloseable {
                                 }
                             });
 
-                            // check messages size does not exceed config.segmentSize
+                            // 单次写入不能超过 segment 大小，否则无法放进任何日志段。
                             if (validRecords.sizeInBytes() > config().segmentSize()) {
                                 throw new RecordBatchTooLargeException("Message batch size is " + validRecords.sizeInBytes() + " bytes in append " +
                                         "to partition " + topicPartition() + ", which exceeds the maximum configured segment size of " + config().segmentSize() + ".");
                             }
 
-                            // maybe roll the log if this segment is full
+                            // 当前 active segment 空间不足时滚动到新 segment。
                             LogSegment segment = maybeRoll(validRecords.sizeInBytes(), appendInfo);
 
                             LogOffsetMetadata logOffsetMetadata = new LogOffsetMetadata(
@@ -1238,13 +1234,13 @@ public class UnifiedLog implements AutoCloseable {
                                     segment.baseOffset(),
                                     segment.size());
 
-                            // now that we have valid records, offsets assigned, and timestamps updated, we need to
-                            // validate the idempotent/transactional state of the producers and collect some metadata
+                            // 校验幂等/事务 producer 状态，识别重复 batch 并收集事务索引更新信息。
                             AnalyzeAndValidateProducerStateResult result = analyzeAndValidateProducerState(
                                 logOffsetMetadata, validRecords, origin, verificationGuard, transactionVersion
                             );
 
                             if (result.maybeDuplicate.isPresent()) {
+                                // 幂等写入发现重复 batch 时不重复落盘，直接返回之前写入的 offset 信息。
                                 BatchMetadata duplicate = result.maybeDuplicate.get();
                                 appendInfo.setFirstOffset(duplicate.firstOffset());
                                 appendInfo.setLastOffset(duplicate.lastOffset());
@@ -1253,36 +1249,30 @@ public class UnifiedLog implements AutoCloseable {
                                 logger.trace("Duplicate batch detected, returning AppendInfo from duplicate batch with last offset: {}, first offset: {}, next offset: {}, skipped messages: {}",
                                         appendInfo.lastOffset(), appendInfo.firstOffset(), localLog.logEndOffset(), validRecords);
                             } else {
-                                // Append the records, and increment the local log end offset immediately after the append because a
-                                // write to the transaction index below may fail, and we want to ensure that the offsets
-                                // of future appends still grow monotonically. The resulting transaction index inconsistency
-                                // will be cleaned up after the log directory is recovered. Note that the end offset of the
-                                // ProducerStateManager will not be updated and the last stable offset will not advance
-                                // if the append to the transaction index fails.
+                                // 进入物理本地日志追加，并立刻推进 LEO，保证后续写入 offset 单调递增。
                                 localLog.append(appendInfo.lastOffset(), validRecords);
                                 updateHighWatermarkWithLogEndOffset();
 
-                                // update the producer state
+                                // 写入成功后更新 producer 状态，支撑幂等和事务的后续校验。
                                 result.updatedProducers.values().forEach(producerStateManager::update);
 
-                                // update the transaction index with the true last stable offset. The last offset visible
-                                // to consumers using READ_COMMITTED will be limited by this value and the high watermark.
+                                // 事务完成时更新事务索引，READ_COMMITTED 消费依赖它计算可见边界。
                                 for (CompletedTxn completedTxn : result.completedTxns) {
                                     long lastStableOffset = producerStateManager.lastStableOffset(completedTxn);
                                     segment.updateTxnIndex(completedTxn, lastStableOffset);
                                     producerStateManager.completeTxn(completedTxn);
                                 }
 
-                                // always update the last producer id map offset so that the snapshot reflects the current offset
-                                // even if there isn't any idempotent data being written
+                                // 更新 producer 状态快照边界，即使本批没有幂等数据也要推进。
                                 producerStateManager.updateMapEndOffset(appendInfo.lastOffset() + 1);
 
-                                // update the first unstable offset (which is used to compute LSO)
+                                // 更新 first unstable offset，供 LSO 计算使用。
                                 maybeIncrementFirstUnstableOffset();
 
                                 logger.trace("Appended message set with last offset: {}, first offset: {}, next offset: {}, and messages: {}",
                                         appendInfo.lastOffset(), appendInfo.firstOffset(), localLog.logEndOffset(), validRecords);
 
+                                // 达到刷盘间隔后触发 flush，推进恢复点。
                                 if (localLog.unflushedMessages() >= config().flushInterval) flush(false);
                             }
                             return appendInfo;

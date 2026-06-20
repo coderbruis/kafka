@@ -191,10 +191,12 @@ public class FileRecords extends AbstractRecords implements Closeable {
      * @return the number of bytes written to the underlying file
      */
     public int append(MemoryRecords records) throws IOException {
+        // 核心总结：把内存 records 写入当前 .log 文件的 FileChannel，并更新已写文件大小。
         if (records.sizeInBytes() > Integer.MAX_VALUE - size.get())
             throw new IllegalArgumentException("Append of size " + records.sizeInBytes() +
                     " bytes is too large for segment with current file position at " + size.get());
 
+        // 进入 MemoryRecords，把底层 ByteBuffer 内容完整写入文件通道。
         int written = records.writeFullyTo(channel);
         size.getAndAdd(written);
         return written;

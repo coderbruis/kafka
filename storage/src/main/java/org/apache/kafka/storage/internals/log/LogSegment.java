@@ -250,24 +250,29 @@ public class LogSegment implements Closeable {
      */
     public void append(long largestOffset,
                        MemoryRecords records) throws IOException {
+        // 核心总结：把 records 追加到当前 segment 的 .log 文件，并按间隔维护 offset/time 索引。
         if (records.sizeInBytes() > 0) {
             LOGGER.trace("Inserting {} bytes at end offset {} at position {}",
                 records.sizeInBytes(), largestOffset, log.sizeInBytes());
+            // 记录写入前的物理位置，后续索引会指向这个 .log 文件位置。
             int physicalPosition = log.sizeInBytes();
 
+            // 确认最大 offset 能用当前 segment base offset 表示成相对 offset。
             ensureOffsetInRange(largestOffset);
 
-            // append the messages
+            // 进入 FileRecords，真正把消息字节写入 .log 文件。
             long appendedBytes = log.append(records);
             LOGGER.trace("Appended {} to {} at end offset {}", appendedBytes, log.file(), largestOffset);
 
             for (RecordBatch batch : records.batches()) {
                 long batchMaxTimestamp = batch.maxTimestamp();
                 long batchLastOffset = batch.lastOffset();
+                // 维护 segment 内最大时间戳及其 offset，供 time index 使用。
                 if (batchMaxTimestamp > maxTimestampSoFar()) {
                     maxTimestampAndOffsetSoFar = new TimestampOffset(batchMaxTimestamp, batchLastOffset);
                 }
 
+                // 累计写入字节超过索引间隔后，写一条稀疏 offset/time 索引。
                 if (bytesSinceLastIndexEntry > indexIntervalBytes) {
                     offsetIndex().append(batchLastOffset, physicalPosition);
                     timeIndex().maybeAppend(maxTimestampSoFar(), shallowOffsetOfMaxTimestampSoFar());

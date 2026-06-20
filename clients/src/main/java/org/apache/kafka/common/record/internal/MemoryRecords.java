@@ -82,10 +82,12 @@ public class MemoryRecords extends AbstractRecords {
      * @throws IOException For any IO errors writing to the channel
      */
     public int writeFullyTo(GatheringByteChannel channel) throws IOException {
+        // 核心总结：循环把底层 ByteBuffer 写入 channel，直到本批 records 的所有字节都写完。
         buffer.mark();
         int written = 0;
         while (written < sizeInBytes())
             written += channel.write(buffer);
+        // 恢复 buffer 位置，避免本次写入影响后续读取或重复写入。
         buffer.reset();
         return written;
     }
