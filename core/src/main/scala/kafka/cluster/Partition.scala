@@ -1216,6 +1216,9 @@ class Partition(val topicPartition: TopicPartition,
     }
   }
 
+  /*
+    分区级 leader 写入口，确认本地 leader 和 min ISR 后把 records 写入 leader log。
+   */
   def appendRecordsToLeader(
     records: MemoryRecords,
     origin: AppendOrigin,
@@ -1224,8 +1227,8 @@ class Partition(val topicPartition: TopicPartition,
     verificationGuard: VerificationGuard = VerificationGuard.SENTINEL,
     transactionVersion: Short = TransactionVersion.TV_UNKNOWN
   ): LogAppendInfo = {
-    // 核心总结：分区级 leader 写入口，确认本地 leader 和 min ISR 后把 records 写入 leader log。
     val (info, leaderHWIncremented) = inReadLock(leaderIsrUpdateLock, () => {
+      // 判断分区是否是leader
       leaderLogIfLocal match {
         case Some(leaderLog) =>
           val minIsr = effectiveMinIsr(leaderLog)

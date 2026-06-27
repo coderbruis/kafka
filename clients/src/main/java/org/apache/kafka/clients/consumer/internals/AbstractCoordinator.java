@@ -553,7 +553,7 @@ public abstract class AbstractCoordinator implements Closeable {
                             generationSnapshot, stateSnapshot);
                     // 重置状态，并请求再次重新加入消费组。
                     resetStateAndRejoin(reason, true);
-                    // 清空这次 join future，避免继续使用已经失败的请求结果。
+                    // 清空这次 join future，避免下一轮poll()继续使用已经失败的请求结果。
                     resetJoinGroupFuture();
                 }
             } else {    // future完成，但是结果失败

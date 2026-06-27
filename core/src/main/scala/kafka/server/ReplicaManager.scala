@@ -1373,6 +1373,7 @@ class ReplicaManager(val config: KafkaConfig,
   }
 
   /**
+   * 核心总结：逐分区写入本地 leader 日志，并把每个分区的成功或异常包装成 LogAppendResult。
    * Append the messages to the local replica logs
    */
   private def appendToLocalLog(internalTopicsAllowed: Boolean,
@@ -1383,7 +1384,10 @@ class ReplicaManager(val config: KafkaConfig,
                                verificationGuards: Map[TopicPartition, VerificationGuard],
                                transactionVersion: Short):
   Map[TopicIdPartition, LogAppendResult] = {
-    // 核心总结：逐分区写入本地 leader 日志，并把每个分区的成功或异常包装成 LogAppendResult。
+
+    // 用Map[TopicIdPartition, LogAppendResult]作为分区返回结果，是因为这个方法是按分区写入的，所以要将不同分区的写入结果进行隔离。
+    // 这和 Kafka ProduceResponse 的模型一致：请求是批量的，结果是分区粒度的。
+
     val traceEnabled = isTraceEnabled
     def processFailedRecord(topicIdPartition: TopicIdPartition, t: Throwable) = {
       val logStartOffset = onlinePartition(topicIdPartition.topicPartition()).map(_.logStartOffset).getOrElse(-1L)
@@ -1414,8 +1418,10 @@ class ReplicaManager(val config: KafkaConfig,
           false))
       } else {
         try {
+          // 找到本地分区，某个分区在这个broker托管的的副本分区，可能是leader副本，也可能是follower副本
           val partition = getPartitionOrException(topicIdPartition)
-          // 进入分区级 leader 写入，继续检查 leader、本地日志和 min ISR。
+          // 进入分区级写入，继续检查 leader、本地日志和 min ISR。注意此时并没有判断到哪个partition是否是leader，判断逻辑在下一层
+          // 还有一个逻辑需要注意，此方法只管写log，不等待复制，复制的职责不在这个方法，写入log和副本日志复制同步是两个不同的任务。
           val info = partition.appendRecordsToLeader(records, origin, requiredAcks, requestLocal,
             verificationGuards.getOrElse(topicIdPartition.topicPartition(), VerificationGuard.SENTINEL), transactionVersion)
           val numAppendedMessages = info.numMessages

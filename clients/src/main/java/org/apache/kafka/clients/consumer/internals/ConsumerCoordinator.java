@@ -482,6 +482,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
      */
     void maybeUpdateSubscriptionMetadata() {
         int version = metadata.updateVersion();
+        // 版本发生变化，刷新meta元数据
         if (version > metadataSnapshot.version) {
             Cluster cluster = metadata.fetch();
 
@@ -530,6 +531,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
     public boolean poll(Timer timer, boolean waitForJoinGroup) {
         maybeUpdateSubscriptionMetadata();
 
+        // 为什么要在这里执行提交回调？
         invokeCompletedOffsetCommitCallbacks();
 
         if (subscriptions.hasAutoAssignedPartitions()) {
@@ -725,6 +727,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
 
         // skip the validation for built-in cooperative sticky assignor since we've considered
         // the "generation" of ownedPartition inside the assignor
+        // 校验自定义 cooperative assignor：如果要迁移某个已被成员持有的分区，必须先让原成员 revoke，下一轮 rebalance 才能分配给新成员。
         if (protocol == RebalanceProtocol.COOPERATIVE && !assignorName.equals(COOPERATIVE_STICKY_ASSIGNOR_NAME)) {
             validateCooperativeAssignment(ownedPartitions, assignments);
         }
