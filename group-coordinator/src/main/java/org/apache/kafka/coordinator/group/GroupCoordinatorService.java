@@ -1122,6 +1122,9 @@ public class GroupCoordinatorService implements GroupCoordinator {
 
         CompletableFuture<SyncGroupResponseData> responseFuture = new CompletableFuture<>();
 
+        // 同一个 group 的 JoinGroup / SyncGroup / Heartbeat / LeaveGroup 等状态变更需要串行化。这些请求被推到了coordinator runtime 队列里串行化执行。
+        // 避免多个网络线程并发修改 group 状态。
+        // SyncGroup请求被封装成了一个CoordinatorWriteEvent，会在MultiThreadedEventProcessor.handleEvents()中执行
         runtime.scheduleWriteOperation(
             "classic-group-sync",
             topicPartitionFor(request.groupId()),

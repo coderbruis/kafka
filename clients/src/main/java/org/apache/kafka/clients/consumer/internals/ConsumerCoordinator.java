@@ -689,6 +689,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
                                                       String assignmentStrategy,
                                                       List<JoinGroupResponseData.JoinGroupResponseMember> allSubscriptions,
                                                       boolean skipAssignment) {
+        // 选择分区分配策略
         ConsumerPartitionAssignor assignor = lookupAssignor(assignmentStrategy);
         if (assignor == null)
             throw new IllegalStateException("Coordinator selected invalid assignment protocol: " + assignmentStrategy);
@@ -723,6 +724,8 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
 
         log.debug("Performing assignment using strategy {} with subscriptions {}", assignorName, subscriptions);
 
+        // key: consumer memberId
+        // value: consumer对应的分区分配信息
         Map<String, Assignment> assignments = assignor.assign(metadata.fetch(), new GroupSubscription(subscriptions)).groupAssignment();
 
         // skip the validation for built-in cooperative sticky assignor since we've considered
@@ -784,6 +787,15 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         }
     }
 
+    /**
+     * onJoinPrepare() 是 rebalance 前置清理阶段，保证旧 assignment 的 offset、回调和本地状态先处理完，再进入新一轮分区分配。
+     * 主要做下面几件事：
+     * 如果开启了自动提交，先提交当前消费 offset。
+     * EAGER 协议下，提交前会把当前分区标记为 pending revocation，避免 revoke 前继续拉取数据。
+     * 等待 offset commit 完成，或等到 rebalance timeout。
+     * 调用 rebalance listener 的分区撤销回调，比如 onPartitionsRevoked。
+     * 清理本地 assignment / subscription 的 group 状态，为下一轮 JoinGroup 做准备。
+     */
     @Override
     protected boolean onJoinPrepare(Timer timer, int generation, String memberId) {
         log.debug("Executing onJoinPrepare with generation {} and memberId {}", generation, memberId);
@@ -847,6 +859,12 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         // so that users can still access the previously owned partitions to commit offsets etc.
         Exception exception = null;
         final SortedSet<TopicPartition> revokedPartitions = new TreeSet<>(COMPARATOR);
+        // 当前 consumer 还没有有效的 group generation / memberId。这个consumer可能
+        // 1.还没成功加入过消费者组
+        // 2.已经离开组或本地 generation 被重置
+        // 3.需要重新加入组，但还没拿到新 generation
+        // 自动分配分区情况下，没有generationId和memberId，没法fetch拉取消息。但是手动分配分区不受影响，能正常fetch拉消息。
+        // generationId/memberId 是组管理身份
         if (generation == Generation.NO_GENERATION.generationId ||
             memberId.equals(Generation.NO_GENERATION.memberId)) {
             revokedPartitions.addAll(subscriptions.assignedPartitions());
@@ -899,6 +917,10 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         return true;
     }
 
+    /**
+     * 在 EAGER rebalance 协议下，把当前已分配的所有分区标记为 pending revocation，也就是“即将被撤销”。
+     * 它是 EAGER 重平衡时，在 revoke 前冻结即将被撤销分区的拉取/返回，避免 auto commit 与继续消费之间产生 offset 不一致。
+     */
     private void maybeMarkPartitionsPendingRevocation() {
         if (protocol != RebalanceProtocol.EAGER) {
             return;

@@ -455,6 +455,7 @@ public class ClassicGroup implements Group {
             throw new IllegalStateException("None of the member's protocols can be supported.");
         }
 
+        // 第一个成功加入 group 的成员，会先被设为 leader。
         if (leaderId.isEmpty()) {
             leaderId = Optional.of(member.memberId());
         }
@@ -1288,9 +1289,14 @@ public class ClassicGroup implements Group {
     }
 
     /**
+     * 1. rebalance版本号递增
+     * 2. 选择protocol
+     * 3. group状态变更为COMPLETING_REBALANCE
+     *
      * Initiate the next generation for the group.
      */
     public void initNextGeneration() {
+        // 消费者组 rebalance 版本号递增
         generationId++;
         if (!members.isEmpty()) {
             setProtocolName(Optional.of(selectProtocol()));
@@ -1319,6 +1325,7 @@ public class ClassicGroup implements Group {
             new JoinGroupResponseMember()
                 .setMemberId(member.memberId())
                 .setGroupInstanceId(member.groupInstanceId().orElse(null))
+                    // 所有成员的订阅信息在 metadata byte[] 里
                 .setMetadata(member.metadata(protocolName.orElse(null))))
             .toList();
     }

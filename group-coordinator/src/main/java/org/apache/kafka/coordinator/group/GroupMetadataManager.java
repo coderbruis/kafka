@@ -7238,6 +7238,7 @@ public class GroupMetadataManager {
 
             return EMPTY_RESULT;
         } else {
+            // 更新rebalance版本号
             group.initNextGeneration();
             if (group.isInState(EMPTY)) {
                 log.info("Group {} with generation {} is now empty.", groupId, group.generationId());
@@ -7265,6 +7266,8 @@ public class GroupMetadataManager {
                 // Complete the awaiting join group response future for all the members after rebalancing
                 group.allMembers().forEach(member -> {
                     List<JoinGroupResponseData.JoinGroupResponseMember> members = List.of();
+
+                    // 让 leader 拿到全组成员信息，用于下一步计算分区分配方案。
                     if (group.isLeader(member.memberId())) {
                         members = group.currentClassicGroupMembers();
                     }
@@ -8022,9 +8025,11 @@ public class GroupMetadataManager {
                 // does not exist, fill with an empty assignment.
                 Map<String, byte[]> assignment = new HashMap<>();
                 request.assignments().forEach(memberAssignment ->
+                        // 分配了分区信息的成员
                     assignment.put(memberAssignment.memberId(), memberAssignment.assignment())
                 );
 
+                // 这段是在兜底：leader 没给某个成员分配结果时，coordinator 给它补一个空 assignment，让本轮 SyncGroup 能完整结束。
                 Map<String, byte[]> membersWithMissingAssignment = new HashMap<>();
                 group.allMembers().forEach(member -> {
                     if (!assignment.containsKey(member.memberId())) {

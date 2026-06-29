@@ -511,6 +511,7 @@ public abstract class AbstractCoordinator implements Closeable {
                 return false;
             }
 
+            // future完成，是指JoinGroup和SyncGroup同时完成了，才会走到这个分支
             if (future.succeeded()) {
                 // 声明变量，用来保存当前 generation 信息快照。generation 表示当前消费组的一代，包括 generation id、member id、协议名。
                 Generation generationSnapshot;
