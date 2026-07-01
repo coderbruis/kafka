@@ -906,6 +906,8 @@ public class RecordAccumulator {
                 batch = deque.pollFirst();
 
                 boolean isTransactional = transactionManager != null && transactionManager.isTransactional();
+
+                // 幂等发送核心逻辑
                 ProducerIdAndEpoch producerIdAndEpoch =
                     transactionManager != null ? transactionManager.producerIdAndEpoch() : null;
                 if (producerIdAndEpoch != null && !batch.hasSequence()) {
@@ -923,6 +925,9 @@ public class RecordAccumulator {
                     // Additionally, we update the next sequence number bound for the partition, and also have
                     // the transaction manager track the batch so as to ensure that sequence ordering is maintained
                     // even if we receive out of order responses.
+
+                    // 幂等核心逻辑，给每个batch写入producerId, producerEpoch, baseSequence
+                    // broker拿到消息之后，就靠这三个字段去重。这也是顺序消息的核心逻辑
                     batch.setProducerState(producerIdAndEpoch, transactionManager.sequenceNumber(batch.topicPartition), isTransactional);
                     transactionManager.incrementSequenceNumber(batch.topicPartition, batch.recordCount);
                     log.debug("Assigned producerId {} and producerEpoch {} to batch with base sequence " +
