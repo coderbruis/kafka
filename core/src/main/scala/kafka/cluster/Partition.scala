@@ -966,6 +966,8 @@ class Partition(val topicPartition: TopicPartition,
         }
 
         val minIsr = effectiveMinIsr(leaderLog)
+        // requiredOffset是本次写入消息的下一个 offset，如果Hw >= requiredOffset
+        // 如果 high watermark 已经推进到这个 offset，说明这条消息已经被足够的 ISR 副本复制到了，可以认为消息足够安全。
         if (leaderLog.highWatermark >= requiredOffset) {
           /*
            * The topic may be configured not to accept messages if there are not enough replicas in ISR
@@ -1008,6 +1010,7 @@ class Partition(val topicPartition: TopicPartition,
    * @return true if the HW was incremented, and false otherwise.
    */
   private def maybeIncrementLeaderHW(leaderLog: UnifiedLog, currentTimeMs: Long = time.milliseconds): Boolean = {
+    // 如果ISR数量小于min.insync.replicas，不推进HW
     if (isUnderMinIsr) {
       trace(s"Not increasing HWM because partition is under min ISR(ISR=${partitionState.isr}")
       return false
@@ -1015,23 +1018,29 @@ class Partition(val topicPartition: TopicPartition,
     // maybeIncrementLeaderHW is in the hot path, the following code is written to
     // avoid unnecessary collection generation
     val leaderLogEndOffset = leaderLog.logEndOffsetMetadata
+    // 将HW初始值设置为leader的LEO
     var newHighWatermark = leaderLogEndOffset
+    // 遍历所有follower副本
     remoteReplicasMap.forEach { (_, replica) =>
       val replicaState = replica.stateSnapshot
 
+      // 判断该 follower 是否已经追上 leader，并且具备加入 ISR 的资格
       def shouldWaitForReplicaToJoinIsr: Boolean = {
         replicaState.isCaughtUp(leaderLogEndOffset.messageOffset, currentTimeMs, replicaLagTimeMaxMs) &&
         isReplicaIsrEligible(replica.brokerId)
       }
 
       // Note here we are using the "maximal", see explanation above
+      // maximal ISR 中的副本，或者已经追上且可加入 ISR 的副本，都需要参与 HW 计算
       if (replicaState.logEndOffsetMetadata.messageOffset < newHighWatermark.messageOffset &&
           (partitionState.maximalIsr.contains(replica.brokerId) || shouldWaitForReplicaToJoinIsr)
       ) {
+        // 如果该副本的 LEO 更小，则用它作为新的 HW 候选值
         newHighWatermark = replicaState.logEndOffsetMetadata
       }
     }
 
+    // 尝试更新 leader 本地 log 的 HW，在leader broker本地更新
     leaderLog.maybeIncrementHighWatermark(newHighWatermark).toScala match {
       case Some(oldHighWatermark) =>
         debug(s"High watermark updated from $oldHighWatermark to $newHighWatermark")

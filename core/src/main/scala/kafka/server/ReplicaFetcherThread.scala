@@ -109,7 +109,7 @@ class ReplicaFetcherThread(name: String,
     completeDelayedFetchRequests()
   }
 
-  // process fetched data
+  // 处理从 leader 拉取的数据，并推进 follower 本地日志状态。
   override def processPartitionData(
     topicPartition: TopicPartition,
     fetchOffset: Long,
@@ -129,7 +129,7 @@ class ReplicaFetcherThread(name: String,
       trace("Follower has replica log end offset %d for partition %s. Received %d bytes of messages and leader hw %d"
         .format(log.logEndOffset, topicPartition, records.sizeInBytes, partitionData.highWatermark))
 
-    // Append the leader's messages to the log
+    // 先追加 leader 返回的消息，再应用 leader 返回的 HW。
     val logAppendInfo = partition.appendRecordsToFollowerOrFutureReplica(records, isFuture = false, partitionLeaderEpoch)
 
     if (logTrace)
@@ -140,6 +140,7 @@ class ReplicaFetcherThread(name: String,
     // For the follower replica, we do not need to keep its segment base offset and physical position.
     // These values will be computed upon becoming leader or handling a preferred read replica fetch.
     var maybeUpdateHighWatermarkMessage = s"but did not update replica high watermark"
+    // follower 不自己计算 HW，直接使用 leader Fetch 响应中的 HW。
     log.maybeUpdateHighWatermark(partitionData.highWatermark).ifPresent { newHighWatermark =>
       maybeUpdateHighWatermarkMessage = s"and updated replica high watermark to $newHighWatermark"
       partitionsWithNewHighWatermark += topicPartition
