@@ -534,6 +534,8 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         // 为什么要在这里执行提交回调？
         invokeCompletedOffsetCommitCallbacks();
 
+        // 调用consumer.subscribe("xxxTopic")就会走下面自动分配分区逻辑；调用consumer.assign("xxTopic")就会走指定分配分区逻辑
+        // 大部分都是走自动分配分区逻辑，少数场景：1）离线回放；2）固定消费分区；3）排查问题，就需要指定分配分区
         if (subscriptions.hasAutoAssignedPartitions()) {
             // 校验自动分配分区策略，为空抛异常拦截
             if (protocol == null) {
